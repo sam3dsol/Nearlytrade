@@ -1,0 +1,4 @@
+target/
+*.wasm
+*.bak-*
+.DS_Store
