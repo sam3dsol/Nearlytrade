@@ -3,7 +3,7 @@ name = "nearpad-locker"
 version = "0.2.0"
 edition = "2021"
 publish = false
-repository = "https://github.com/sam3dsol/NearlyTrade"
+repository = "https://github.com/sam3dsol/Nearlytrade"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
