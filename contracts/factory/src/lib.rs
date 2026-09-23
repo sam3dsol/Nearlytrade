@@ -8,6 +8,7 @@ use near_sdk::{
 
 const BPS: u128 = 10_000;
 const TOKEN_DECIMALS: u8 = 18;
+const NEAR_DECIMALS: u8 = 24;
 const STORAGE_PRICE_PER_BYTE: u128 = 10_000_000_000_000_000_000;
 const TOKEN_BASE_STORAGE_BYTES: u128 = 3_000;
 const FT_STORAGE_REG: NearToken = NearToken::from_yoctonear(1_250_000_000_000_000_000_000);
@@ -22,15 +23,34 @@ const POINT_MAX: i32 = 500_000;
 
 const GAS_TOKEN_INIT: Gas = Gas::from_tgas(15);
 const GAS_DCL_POOL: Gas = Gas::from_tgas(10);
-const GAS_LOCKER_ADD: Gas = Gas::from_tgas(200);
+const GAS_LOCKER_ADD: Gas = Gas::from_tgas(180);
 const GAS_LOCKER_CLAIM: Gas = Gas::from_tgas(180);
-const GAS_DEV_BUY: Gas = Gas::from_tgas(80);
+const GAS_DEV_BUY: Gas = Gas::from_tgas(160);
 const GAS_BALANCE_OF: Gas = Gas::from_tgas(5);
 const GAS_DELIVER: Gas = Gas::from_tgas(12);
 const GAS_CB_MIN: Gas = Gas::from_tgas(8);
-const GAS_RESERVE: Gas = Gas::from_tgas(15);
-const GAS_RESERVE_LAUNCH: Gas = Gas::from_tgas(30);
+const GAS_RESERVE: Gas = Gas::from_tgas(10);
+const GAS_RESERVE_LAUNCH: Gas = Gas::from_tgas(18);
 const GAS_UNWRAP: Gas = Gas::from_tgas(10);
+
+const fn tg(g: Gas) -> u64 { g.as_gas() / 1_000_000_000_000 }
+const T_AFTER_LAUNCH: u64 = 300 - 8;
+const T_CB_BURN: u64 = 4;
+const T_AT_ON_CREATED: u64 = T_AFTER_LAUNCH - tg(step_gas_create_token()) - tg(GAS_RESERVE_LAUNCH) - T_CB_BURN;
+const T_AT_ON_LIQUIDITY: u64 = T_AT_ON_CREATED - tg(GAS_LOCKER_ADD) - tg(GAS_RESERVE) - T_CB_BURN;
+const _: () = assert!(
+    T_AT_ON_LIQUIDITY >= tg(GAS_CB_MIN) + tg(GAS_RESERVE),
+    "the launch chain can no longer reach on_liquidity_added",
+);
+const T_DEV_BUY_NEEDS: u64 = tg(GAS_DEV_BUY) + 10 + tg(GAS_CB_MIN) + tg(GAS_RESERVE);
+const _: () = assert!(
+    T_DEV_BUY_NEEDS + tg(GAS_RESERVE_LAUNCH) <= 300,
+    "step_gas(DevBuy) no longer fits in a transaction of its own",
+);
+const _: () = assert!(tg(GAS_DEV_BUY) + 10 >= tg(GAS_DEV_BUY) + 5 + 5, "step_gas(DevBuy) must cover its own batch");
+const T_CREATE_TOKEN_BATCH: u64 = tg(GAS_TOKEN_INIT) + 5 + 5 + tg(GAS_DCL_POOL);
+const _: () = assert!(tg(step_gas_create_token()) >= T_CREATE_TOKEN_BATCH, "step_gas(CreateToken) must cover BOTH batches it schedules");
+const fn step_gas_create_token() -> Gas { Gas::from_tgas(tg(GAS_TOKEN_INIT) + tg(GAS_DCL_POOL) + 10) }
 const GAS_ON_SPLIT: Gas = Gas::from_tgas(4);
 const GAS_ON_SWEPT: Gas = Gas::from_tgas(4);
 const GAS_ON_FEES_CLAIMED: Gas = Gas::from_tgas(45);
@@ -46,6 +66,7 @@ enum StorageKey {
     CreatorFees,
     CreatorTokenFees,
     SymbolIndex,
+    Quotes,
 }
 
 #[near(serializers = [borsh, json])]
@@ -65,6 +86,18 @@ pub struct Config {
     pub max_dev_buy_bps: u16,
     pub max_wallet_bps: u16,
     pub max_wallet_ms: u64,
+}
+
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug)]
+pub struct QuoteAsset {
+    pub decimals: u8,
+    pub init_point: i32,
+    pub min_init_point: i32,
+    pub max_init_point: i32,
+    pub range_points: i32,
+    pub native: bool,
+    pub enabled: bool,
 }
 
 #[near(serializers = [borsh, json])]
@@ -122,6 +155,11 @@ pub struct Launch {
     pub fees_token_total: U128,
     pub creator_token_fees: U128,
     pub protocol_token_fees: U128,
+
+    pub quote: AccountId,
+    pub fees_quote_total: U128,
+    pub creator_quote_fees: U128,
+    pub protocol_quote_fees: U128,
 }
 
 #[near(serializers = [json])]
@@ -134,6 +172,7 @@ pub struct LaunchArgs {
     pub links: Option<Links>,
     pub dev_buy: Option<U128>,
     pub init_point: Option<i32>,
+    pub quote: Option<AccountId>,
 }
 
 #[near(serializers = [json])]
@@ -218,6 +257,8 @@ pub struct Factory {
     dcl_registered: bool,
     wnear_registered: bool,
     symbol_index: LookupMap<String, u64>,
+    quotes: LookupMap<AccountId, QuoteAsset>,
+    quote_ids: Vec<AccountId>,
     locker_id: AccountId,
     protocol_recipients: Vec<(AccountId, u16)>,
     house_creator: Option<AccountId>,
@@ -226,24 +267,7 @@ pub struct Factory {
 }
 
 #[near(serializers = [borsh])]
-pub struct OldConfig {
-    pub total_supply: U128,
-    pub pool_fee: u32,
-    pub init_point: i32,
-    pub min_init_point: i32,
-    pub max_init_point: i32,
-    pub range_points: i32,
-    pub launch_fee: U128,
-    pub creator_fee_share_bps: u16,
-    pub dcl_storage_per_launch: U128,
-    pub max_icon_bytes: u32,
-    pub unique_symbols: bool,
-    pub max_dev_buy_bps: u16,
-    pub max_wallet_bps: u16,
-    pub max_wallet_ms: u64,
-}
-#[near(serializers = [borsh])]
-pub struct OldLaunch {
+pub struct V4Launch {
     pub id: u64, pub token: AccountId, pub creator: AccountId, pub name: String, pub symbol: String, pub icon: Option<String>,
     pub description: String, pub links: Links, pub created_at_ms: u64, pub total_supply: U128, pub pool_id: String, pub token_is_x: bool,
     pub init_point: i32, pub left_point: i32, pub right_point: i32, pub lpt_id: Option<String>, pub step: Step, pub inflight: bool,
@@ -251,25 +275,7 @@ pub struct OldLaunch {
     pub fees_token_total: U128, pub creator_token_fees: U128, pub protocol_token_fees: U128,
 }
 #[near(serializers = [borsh])]
-pub struct OldFactory {
-    owner_id: AccountId,
-    token_code_hash: CryptoHash,
-    wnear_id: AccountId,
-    dcl_id: AccountId,
-    config: OldConfig,
-    paused: bool,
-    next_id: u64,
-    launches: LookupMap<u64, OldLaunch>,
-    token_index: LookupMap<AccountId, u64>,
-    creator_fees: LookupMap<AccountId, u128>,
-    protocol_fees: u128,
-    dcl_registered: bool,
-    wnear_registered: bool,
-    symbol_index: LookupMap<String, u64>,
-}
-
-#[near(serializers = [borsh])]
-pub struct V3Factory {
+pub struct V4Factory {
     owner_id: AccountId,
     token_code_hash: CryptoHash,
     wnear_id: AccountId,
@@ -277,7 +283,7 @@ pub struct V3Factory {
     config: Config,
     paused: bool,
     next_id: u64,
-    launches: LookupMap<u64, Launch>,
+    launches: LookupMap<u64, V4Launch>,
     token_index: LookupMap<AccountId, u64>,
     creator_fees: LookupMap<AccountId, u128>,
     protocol_fees: u128,
@@ -288,114 +294,48 @@ pub struct V3Factory {
     protocol_recipients: Vec<(AccountId, u16)>,
     house_creator: Option<AccountId>,
     min_push_yocto: u128,
+    min_claim_yocto: u128,
 }
-
-#[near(serializers = [borsh])]
-pub struct PrevFactory {
-    owner_id: AccountId,
-    token_code_hash: CryptoHash,
-    wnear_id: AccountId,
-    dcl_id: AccountId,
-    config: Config,
-    paused: bool,
-    next_id: u64,
-    launches: LookupMap<u64, Launch>,
-    token_index: LookupMap<AccountId, u64>,
-    creator_fees: LookupMap<AccountId, u128>,
-    protocol_fees: u128,
-    dcl_registered: bool,
-    wnear_registered: bool,
-    symbol_index: LookupMap<String, u64>,
-    locker_id: AccountId,
-}
-
 #[near]
 impl Factory {
     #[private]
     #[init(ignore_state)]
-    pub fn migrate(locker_id: AccountId) -> Self {
-        let o: OldFactory = env::state_read().expect("old state");
-        let c = o.config;
-        let mut launches: LookupMap<u64, Launch> = LookupMap::new(b"L2".to_vec());
+    pub fn migrate_v5() -> Self {
+        let o: V4Factory = env::state_read().expect("old state");
+        let mut launches: LookupMap<u64, Launch> = LookupMap::new(b"L3".to_vec());
         for id in 0..o.next_id {
             if let Some(l) = o.launches.get(&id) {
                 launches.insert(id, Launch {
                     id: l.id, token: l.token.clone(), creator: l.creator.clone(), name: l.name.clone(), symbol: l.symbol.clone(), icon: l.icon.clone(),
-                    description: l.description.clone(), links: l.links.clone(), created_at_ms: l.created_at_ms, total_supply: l.total_supply, pool_id: l.pool_id.clone(),
-                    token_is_x: l.token_is_x, init_point: l.init_point, left_point: l.left_point, right_point: l.right_point, lpt_id: l.lpt_id.clone(), step: l.step,
-                    inflight: l.inflight, dev_buy_near: l.dev_buy_near, dev_buy_exact: l.dev_buy_exact, dev_buy_tokens: l.dev_buy_tokens, dev_buy_held: l.dev_buy_held, claims: l.claims,
-                    fees_near_total: l.fees_near_total, fees_token_total: l.fees_token_total, creator_token_fees: l.creator_token_fees, protocol_token_fees: l.protocol_token_fees,
+                    description: l.description.clone(), links: l.links.clone(), created_at_ms: l.created_at_ms, total_supply: l.total_supply,
+                    pool_id: l.pool_id.clone(), token_is_x: l.token_is_x, init_point: l.init_point, left_point: l.left_point, right_point: l.right_point,
+                    lpt_id: l.lpt_id.clone(), step: l.step, inflight: l.inflight, dev_buy_near: l.dev_buy_near, dev_buy_exact: l.dev_buy_exact,
+                    dev_buy_tokens: l.dev_buy_tokens, dev_buy_held: l.dev_buy_held, claims: l.claims, fees_near_total: l.fees_near_total,
+                    fees_token_total: l.fees_token_total, creator_token_fees: l.creator_token_fees, protocol_token_fees: l.protocol_token_fees,
+                    quote: o.wnear_id.clone(),
+                    fees_quote_total: U128(0), creator_quote_fees: U128(0), protocol_quote_fees: U128(0),
                 });
             }
         }
+        let mut quotes: LookupMap<AccountId, QuoteAsset> = LookupMap::new(StorageKey::Quotes);
+        quotes.insert(o.wnear_id.clone(), QuoteAsset {
+            decimals: NEAR_DECIMALS,
+            init_point: o.config.init_point,
+            min_init_point: o.config.min_init_point,
+            max_init_point: o.config.max_init_point,
+            range_points: o.config.range_points,
+            native: true,
+            enabled: true,
+        });
         Self {
-            owner_id: o.owner_id,
-            token_code_hash: o.token_code_hash,
-            wnear_id: o.wnear_id,
-            dcl_id: o.dcl_id,
-            config: Config {
-                total_supply: c.total_supply, pool_fee: c.pool_fee, init_point: c.init_point, min_init_point: c.min_init_point,
-                max_init_point: c.max_init_point, range_points: c.range_points, launch_fee: c.launch_fee,
-                creator_fee_share_bps: c.creator_fee_share_bps, dcl_storage_per_launch: c.dcl_storage_per_launch,
-                max_icon_bytes: c.max_icon_bytes, unique_symbols: c.unique_symbols,
-                max_dev_buy_bps: c.max_dev_buy_bps, max_wallet_bps: c.max_wallet_bps, max_wallet_ms: c.max_wallet_ms,
-            },
-            paused: o.paused,
-            next_id: o.next_id,
-            launches,
-            token_index: o.token_index,
-            creator_fees: o.creator_fees,
-            protocol_fees: o.protocol_fees,
-            dcl_registered: o.dcl_registered,
-            wnear_registered: o.wnear_registered,
-            symbol_index: o.symbol_index,
-            locker_id,
-            protocol_recipients: Vec::new(),
-            house_creator: None,
-            min_push_yocto: 50_000_000_000_000_000_000_000,
-            min_claim_yocto: 50_000_000_000_000_000_000_000,
-        }
-    }
-
-    #[private]
-    #[init(ignore_state)]
-    pub fn migrate_v4() -> Self {
-        let o: V3Factory = env::state_read().expect("old state");
-        Self {
-            owner_id: o.owner_id, token_code_hash: o.token_code_hash, wnear_id: o.wnear_id, dcl_id: o.dcl_id,
-            config: o.config, paused: o.paused, next_id: o.next_id, launches: o.launches,
+            owner_id: o.owner_id, token_code_hash: o.token_code_hash, wnear_id: o.wnear_id.clone(), dcl_id: o.dcl_id,
+            config: o.config, paused: o.paused, next_id: o.next_id, launches,
             token_index: o.token_index, creator_fees: o.creator_fees, protocol_fees: o.protocol_fees,
             dcl_registered: o.dcl_registered, wnear_registered: o.wnear_registered, symbol_index: o.symbol_index,
             locker_id: o.locker_id, protocol_recipients: o.protocol_recipients, house_creator: o.house_creator,
-            min_push_yocto: o.min_push_yocto,
-            min_claim_yocto: 50_000_000_000_000_000_000_000,
-        }
-    }
-
-    #[private]
-    #[init(ignore_state)]
-    pub fn migrate_v3() -> Self {
-        let o: PrevFactory = env::state_read().expect("old state");
-        Self {
-            owner_id: o.owner_id,
-            token_code_hash: o.token_code_hash,
-            wnear_id: o.wnear_id,
-            dcl_id: o.dcl_id,
-            config: o.config,
-            paused: o.paused,
-            next_id: o.next_id,
-            launches: o.launches,
-            token_index: o.token_index,
-            creator_fees: o.creator_fees,
-            protocol_fees: o.protocol_fees,
-            dcl_registered: o.dcl_registered,
-            wnear_registered: o.wnear_registered,
-            symbol_index: o.symbol_index,
-            locker_id: o.locker_id,
-            protocol_recipients: Vec::new(),
-            house_creator: None,
-            min_push_yocto: 50_000_000_000_000_000_000_000,
-            min_claim_yocto: 50_000_000_000_000_000_000_000,
+            min_push_yocto: o.min_push_yocto, min_claim_yocto: o.min_claim_yocto,
+            quotes,
+            quote_ids: vec![o.wnear_id],
         }
     }
 
@@ -403,6 +343,8 @@ impl Factory {
     pub fn new(owner_id: AccountId, token_code_hash: String, wnear_id: AccountId, dcl_id: AccountId, locker_id: AccountId, config: Option<Config>) -> Self {
         let config = config.unwrap_or_else(Config::default_mainnet);
         config.validate();
+        let (cfg_init, cfg_min, cfg_max, cfg_range) = (config.init_point, config.min_init_point, config.max_init_point, config.range_points);
+        let wnear = wnear_id.clone();
         Self {
             owner_id,
             token_code_hash: parse_hex32(&token_code_hash),
@@ -421,6 +363,15 @@ impl Factory {
             locker_id,
             protocol_recipients: Vec::new(),
             house_creator: None,
+            quotes: {
+                let mut q: LookupMap<AccountId, QuoteAsset> = LookupMap::new(StorageKey::Quotes);
+                q.insert(wnear.clone(), QuoteAsset {
+                    decimals: NEAR_DECIMALS, init_point: cfg_init, min_init_point: cfg_min, max_init_point: cfg_max,
+                    range_points: cfg_range, native: true, enabled: true,
+                });
+                q
+            },
+            quote_ids: vec![wnear],
             min_push_yocto: 50_000_000_000_000_000_000_000,
             min_claim_yocto: 50_000_000_000_000_000_000_000,
         }
@@ -448,11 +399,18 @@ impl Factory {
             require!(icon.starts_with("data:image/") || icon.starts_with("https://") || icon.starts_with("ipfs://"), "icon: data:image/, https:// or ipfs://");
             require!(icon_len <= self.config.max_icon_bytes as usize, "icon too large");
         }
-        let init_x = args.init_point.unwrap_or(self.config.init_point).clamp(self.config.min_init_point, self.config.max_init_point);
+        let quote_id = args.quote.clone().unwrap_or_else(|| self.wnear_id.clone());
+        let q = self.quotes.get(&quote_id).cloned().unwrap_or_else(|| env::panic_str("quote asset not approved"));
+        require!(q.enabled, "quote asset is disabled");
+
+        let init_x = args.init_point.unwrap_or(q.init_point).clamp(q.min_init_point, q.max_init_point);
         let init_x = floor_to(init_x, POINT_DELTA_1PCT);
 
         let requested = args.dev_buy.map(|v| v.0).unwrap_or(0);
-        let cap = dev_buy_cap_yocto(init_x + POINT_DELTA_1PCT, self.config.total_supply.0, self.config.max_dev_buy_bps, self.config.pool_fee);
+        require!(requested == 0 || q.native, "dev buy is only available on the NEAR pair");
+        let cap = if requested == 0 { 0 } else {
+            dev_buy_cap_yocto(init_x + POINT_DELTA_1PCT, self.config.total_supply.0, self.config.max_dev_buy_bps, self.config.pool_fee)
+        };
         let (dev_buy, dev_buy_exact) = if requested == 0 {
             (0, false)
         } else if requested >= cap + cap / 100 {
@@ -478,10 +436,11 @@ impl Factory {
         let seed = env::random_seed();
         let token: AccountId = format!("{}-{}.{}", slug, hex6(&seed), env::current_account_id()).parse().expect("token account id");
 
-        let token_is_x = token.as_str() < self.wnear_id.as_str();
-        let (a, b) = if token_is_x { (&token, &self.wnear_id) } else { (&self.wnear_id, &token) };
+        let token_is_x = token.as_str() < quote_id.as_str();
+        let (a, b) = if token_is_x { (&token, &quote_id) } else { (&quote_id, &token) };
         let pool_id = format!("{}|{}|{}", a, b, self.config.pool_fee);
-        let top = (init_x.saturating_add(self.config.range_points)).min(POINT_MAX);
+        let top = (init_x.saturating_add(q.range_points)).min(POINT_MAX);
+        require!(top - init_x >= POINT_DELTA_1PCT * 2, "pair's range_points is too small to open a position");
         let (init_point, left_point, right_point) = if token_is_x {
             (init_x, init_x + POINT_DELTA_1PCT, top)
         } else {
@@ -516,6 +475,10 @@ impl Factory {
             fees_token_total: U128(0),
             creator_token_fees: U128(0),
             protocol_token_fees: U128(0),
+            quote: quote_id.clone(),
+            fees_quote_total: U128(0),
+            creator_quote_fees: U128(0),
+            protocol_quote_fees: U128(0),
         };
         self.protocol_fees += cost.launch_fee.0;
         self.token_index.insert(token, id);
@@ -526,8 +489,8 @@ impl Factory {
         emit(
             "launch_started",
             &format!(
-                r#"{{"id":{},"token":"{}","creator":"{}","name":{},"symbol":{},"pool_id":{},"init_point":{},"left_point":{},"right_point":{},"dev_buy":"{}","ts_ms":{}}}"#,
-                id, l.token, l.creator, js(&l.name), js(&l.symbol), js(&l.pool_id), l.init_point, l.left_point, l.right_point, dev_buy, l.created_at_ms
+                r#"{{"id":{},"token":"{}","creator":"{}","name":{},"symbol":{},"pool_id":{},"quote":"{}","init_point":{},"left_point":{},"right_point":{},"dev_buy":"{}","ts_ms":{}}}"#,
+                id, l.token, l.creator, js(&l.name), js(&l.symbol), js(&l.pool_id), l.quote, l.init_point, l.left_point, l.right_point, dev_buy, l.created_at_ms
             ),
         );
         self.internal_run_step(id, l, cost.token_storage.0)
@@ -702,12 +665,13 @@ impl Factory {
         require!(!l.inflight, "claim in flight");
         let lpt = l.lpt_id.clone().expect("lpt");
         let (token, token_is_x) = (l.token.clone(), l.token_is_x);
+        let quote_arg = if l.quote == self.wnear_id { "null".to_string() } else { format!("\"{}\"", l.quote) };
         l.inflight = true;
         self.launches.insert(launch_id.0, l);
         Promise::new(self.locker_id.clone())
             .function_call(
                 "claim".to_string(),
-                format!(r#"{{"lpt_id":{},"token":"{}","token_is_x":{}}}"#, js(&lpt), token, token_is_x).into_bytes(),
+                format!(r#"{{"lpt_id":{},"token":"{}","token_is_x":{},"quote":{}}}"#, js(&lpt), token, token_is_x, quote_arg).into_bytes(),
                 NO_DEPOSIT,
                 GAS_LOCKER_CLAIM,
             )
@@ -726,26 +690,34 @@ impl Factory {
             self.launches.insert(id, l);
             return false;
         }
-        let (fee_tok, fee_near) = if l.token_is_x { (v[0].0, v[1].0) } else { (v[1].0, v[0].0) };
+        let (fee_tok, fee_quote) = if l.token_is_x { (v[0].0, v[1].0) } else { (v[1].0, v[0].0) };
         let share = l_share(self.config.creator_fee_share_bps);
-        let c_near = fee_near * share / BPS;
-        let p_near = fee_near - c_near;
+        let c_quote = fee_quote * share / BPS;
+        let p_quote = fee_quote - c_quote;
         let c_tok = fee_tok * share / BPS;
         let p_tok = fee_tok - c_tok;
-        let house = self.house_creator.as_ref() == Some(&l.creator);
-        if c_near > 0 && !house {
-            let cur = self.creator_fees.get(&l.creator).copied().unwrap_or(0);
-            self.creator_fees.insert(l.creator.clone(), cur + c_near);
+        let house = self.is_house(&l.creator);
+        let native = l.quote == self.wnear_id;
+        if native {
+            if c_quote > 0 && !house {
+                let cur = self.creator_fees.get(&l.creator).copied().unwrap_or(0);
+                self.creator_fees.insert(l.creator.clone(), cur + c_quote);
+            }
+            self.protocol_fees += p_quote + if house { c_quote } else { 0 };
+            l.fees_near_total = U128(l.fees_near_total.0 + fee_quote);
+        } else {
+            l.creator_quote_fees = U128(l.creator_quote_fees.0 + if house { 0 } else { c_quote });
+            l.protocol_quote_fees = U128(l.protocol_quote_fees.0 + p_quote + if house { c_quote } else { 0 });
+            l.fees_quote_total = U128(l.fees_quote_total.0 + fee_quote);
         }
-        self.protocol_fees += p_near + if house { c_near } else { 0 };
-        l.creator_token_fees = U128(l.creator_token_fees.0 + c_tok);
-        l.protocol_token_fees = U128(l.protocol_token_fees.0 + p_tok);
-        l.fees_near_total = U128(l.fees_near_total.0 + fee_near);
+        l.creator_token_fees = U128(l.creator_token_fees.0 + if house { 0 } else { c_tok });
+        l.protocol_token_fees = U128(l.protocol_token_fees.0 + p_tok + if house { c_tok } else { 0 });
         l.fees_token_total = U128(l.fees_token_total.0 + fee_tok);
         l.claims += 1;
         emit(
             "fees_claimed",
-            &format!(r#"{{"id":{},"token":"{}","fee_near":"{}","fee_token":"{}","creator_near":"{}","protocol_near":"{}","ts_ms":{}}}"#, id, l.token, fee_near, fee_tok, c_near, p_near, env::block_timestamp_ms()),
+            &format!(r#"{{"id":{},"token":"{}","quote":"{}","fee_near":"{}","fee_quote":"{}","fee_token":"{}","creator_quote":"{}","protocol_quote":"{}","ts_ms":{}}}"#,
+                id, l.token, l.quote, if native { fee_quote } else { 0 }, fee_quote, fee_tok, c_quote, p_quote, env::block_timestamp_ms()),
         );
         self.launches.insert(id, l);
         self.drain_protocol_fees();
@@ -807,6 +779,81 @@ impl Factory {
         self.internal_send_tokens(&l.token, &l.creator, amount, "fees")
     }
 
+    pub fn get_quotes(&self) -> Vec<(AccountId, QuoteAsset)> {
+        self.quote_ids.iter().filter_map(|id| self.quotes.get(id).map(|q| (id.clone(), q.clone()))).collect()
+    }
+
+    pub fn get_quote(&self, quote: AccountId) -> Option<QuoteAsset> {
+        self.quotes.get(&quote).cloned()
+    }
+
+    pub fn claim_creator_quote_fees(&mut self, launch_id: U64) -> Promise {
+        let mut l = self.launches.get(&launch_id.0).cloned().expect("launch");
+        require!(env::predecessor_account_id() == l.creator, "creator only");
+        require!(l.quote != self.wnear_id, "NEAR pair: use claim_creator_fees");
+        let amount = l.creator_quote_fees.0;
+        require!(amount > 0, "nothing to claim");
+        l.creator_quote_fees = U128(0);
+        self.launches.insert(launch_id.0, l.clone());
+        emit("creator_quote_fees_claimed", &format!(r#"{{"id":{},"creator":"{}","quote":"{}","amount":"{}"}}"#, l.id, l.creator, l.quote, amount));
+        self.internal_send_tokens(&l.quote, &l.creator, amount, "fees")
+    }
+
+    pub fn set_quote(&mut self, quote: AccountId, decimals: u8, init_point: i32, min_init_point: i32, max_init_point: i32, range_points: i32, enabled: bool) {
+        self.assert_owner();
+        require!(min_init_point <= init_point && init_point <= max_init_point, "init_point outside its own bounds");
+        require!(decimals <= 24, "decimals: 0-24");
+        require!(range_points >= POINT_DELTA_1PCT * 2, "range_points too small to open a position");
+        require!((max_init_point.saturating_add(range_points)).min(POINT_MAX) - min_init_point <= 550_000, "range would exceed DCL's liquidity ceiling at the low end of this pair's bounds");
+        let native = quote == self.wnear_id;
+        if !self.quote_ids.contains(&quote) {
+            require!(self.quote_ids.len() < 64, "too many pair assets");
+            self.quote_ids.push(quote.clone());
+        }
+        self.quotes.insert(quote.clone(), QuoteAsset { decimals, init_point, min_init_point, max_init_point, range_points, native, enabled });
+        emit("quote_set", &format!(r#"{{"quote":"{}","decimals":{},"init_point":{},"enabled":{}}}"#, quote, decimals, init_point, enabled));
+    }
+
+    pub fn set_quote_enabled(&mut self, quote: AccountId, enabled: bool) {
+        self.assert_owner();
+        let mut q = self.quotes.get(&quote).cloned().expect("unknown pair asset");
+        q.enabled = enabled;
+        self.quotes.insert(quote.clone(), q);
+        emit("quote_set", &format!(r#"{{"quote":"{}","enabled":{}}}"#, quote, enabled));
+    }
+
+    #[payable]
+    pub fn register_quote(&mut self, quote: AccountId) -> Promise {
+        self.assert_owner();
+        require!(self.quotes.contains_key(&quote), "unknown pair asset");
+        let half = env::attached_deposit().as_yoctonear() / 2;
+        require!(half >= FT_STORAGE_REG.as_yoctonear(), "attach at least 0.0025 NEAR");
+        Promise::new(quote.clone())
+            .function_call(
+                "storage_deposit".to_string(),
+                format!(r#"{{"account_id":"{}","registration_only":true}}"#, env::current_account_id()).into_bytes(),
+                NearToken::from_yoctonear(half),
+                Gas::from_tgas(10),
+            )
+            .then(Promise::new(self.locker_id.clone()).function_call(
+                "register".to_string(),
+                format!(r#"{{"token":"{}"}}"#, quote).into_bytes(),
+                NearToken::from_yoctonear(half),
+                Gas::from_tgas(20),
+            ))
+    }
+
+    pub fn withdraw_protocol_quote_fees(&mut self, launch_id: U64, to: AccountId) -> Promise {
+        self.assert_owner();
+        let mut l = self.launches.get(&launch_id.0).cloned().expect("launch");
+        let amount = l.protocol_quote_fees.0;
+        require!(amount > 0, "nothing to withdraw");
+        l.protocol_quote_fees = U128(0);
+        self.launches.insert(launch_id.0, l.clone());
+        emit("protocol_quote_fees_withdrawn", &format!(r#"{{"id":{},"quote":"{}","to":"{}","amount":"{}"}}"#, l.id, l.quote, to, amount));
+        self.internal_send_tokens(&l.quote, &to, amount, "protocol fees")
+    }
+
     pub fn set_config(&mut self, config: Config) {
         self.assert_owner();
         config.validate();
@@ -841,6 +888,48 @@ impl Factory {
     pub fn set_house_creator(&mut self, house_creator: Option<AccountId>) {
         self.assert_owner();
         self.house_creator = house_creator;
+    }
+
+    pub fn set_house_creators(&mut self, accounts: Vec<AccountId>, on: bool) {
+        self.assert_owner();
+        for a in accounts {
+            let k = house_key(&a);
+            if on { env::storage_write(&k, &[1]); } else { env::storage_remove(&k); }
+            emit("house_creator_set", &format!(r#"{{"account":"{}","on":{}}}"#, a, on));
+        }
+    }
+
+    pub fn is_house_creator(&self, account_id: AccountId) -> bool { self.is_house(&account_id) }
+
+    pub fn split_protocol_token_fees(&mut self, launch_id: U64) {
+        require!(!self.protocol_recipients.is_empty(), "no recipients");
+        let mut l = self.launches.get(&launch_id.0).cloned().expect("launch");
+        let house = self.is_house(&l.creator);
+        let amount = l.protocol_token_fees.0 + if house { l.creator_token_fees.0 } else { 0 };
+        require!(amount > 0, "nothing to split");
+        l.protocol_token_fees = U128(0);
+        if house { l.creator_token_fees = U128(0); }
+        self.launches.insert(launch_id.0, l.clone());
+        let bps: Vec<u16> = self.protocol_recipients.iter().map(|(_, b)| *b).collect();
+        let legs = split_legs(amount, &bps);
+        for (i, cut) in legs.into_iter().enumerate() {
+            if cut == 0 { continue; }
+            let who = self.protocol_recipients[i].0.clone();
+            self.internal_send_tokens(&l.token, &who, cut, "protocol fees")
+                .then(Self::ext(env::current_account_id()).with_static_gas(GAS_ON_SPLIT).on_token_split(launch_id, who, U128(cut)))
+                .detach();
+        }
+        emit("protocol_token_fees_split", &format!(r#"{{"id":{},"token":"{}","amount":"{}"}}"#, l.id, l.token, amount));
+    }
+
+    #[private]
+    pub fn on_token_split(&mut self, launch_id: U64, to: AccountId, amount: U128, #[callback_result] r: Result<(), PromiseError>) {
+        if r.is_err() {
+            let mut l = self.launches.get(&launch_id.0).cloned().expect("launch");
+            l.protocol_token_fees = U128(l.protocol_token_fees.0 + amount.0);
+            self.launches.insert(launch_id.0, l);
+            emit("protocol_token_split_failed", &format!(r#"{{"id":{},"to":"{}","amount":"{}"}}"#, launch_id.0, to, amount.0));
+        }
     }
 
     pub fn set_min_push(&mut self, min_push: U128) {
@@ -1021,6 +1110,10 @@ impl Factory {
 }
 
 impl Factory {
+    fn is_house(&self, a: &AccountId) -> bool {
+        self.house_creator.as_ref() == Some(a) || env::storage_has_key(&house_key(a))
+    }
+
     fn assert_owner(&self) {
         require!(env::predecessor_account_id() == self.owner_id, "owner only");
     }
@@ -1066,7 +1159,7 @@ impl Factory {
 
     fn internal_advance(&mut self, id: u64, l: Launch) -> PromiseOrValue<bool> {
         let need = step_gas(l.step).saturating_add(GAS_CB_MIN).saturating_add(GAS_RESERVE);
-        if gas_left() < need {
+        if l.step == Step::DevBuy || gas_left() < need {
             emit("launch_step_parked", &format!(r#"{{"id":{},"step":"{:?}"}}"#, id, l.step));
             self.launches.insert(id, l);
             return PromiseOrValue::Value(true);
@@ -1167,7 +1260,7 @@ impl Factory {
     }
 
     fn internal_pool_batch(&self, l: &Launch, me: &AccountId) -> Promise {
-        let (a, b) = if l.token_is_x { (&l.token, &self.wnear_id) } else { (&self.wnear_id, &l.token) };
+        let (a, b) = if l.token_is_x { (&l.token, &l.quote) } else { (&l.quote, &l.token) };
         let storage = if self.dcl_registered { self.config.dcl_storage_per_launch.0 } else { DCL_REGISTER.as_yoctonear() };
         let _ = me;
         Promise::new(self.dcl_id.clone())
@@ -1247,7 +1340,9 @@ fn step_gas(step: Step) -> Gas {
     }
 }
 
+const POW_MAX_POINT: u32 = 29_000;
 fn pow_1_0001_fp(p: i32) -> u128 {
+    require!(p.unsigned_abs() <= POW_MAX_POINT, "point out of range for the fixed-point power");
     let mut e = p.unsigned_abs();
     let mut base = ONE_0001_FP;
     let mut acc = FP;
@@ -1255,8 +1350,10 @@ fn pow_1_0001_fp(p: i32) -> u128 {
         if e & 1 == 1 {
             acc = acc * base / FP;
         }
-        base = base * base / FP;
         e >>= 1;
+        if e > 0 {
+            base = base * base / FP;
+        }
     }
     if p < 0 { FP * FP / acc } else { acc }
 }
@@ -1356,6 +1453,33 @@ mod tests {
     }
 
     #[test]
+    fn a_pairs_points_are_not_transferable_between_assets() {
+        let point_for = |fdv_quote: f64, dec_quote: i32| -> i32 {
+            let supply = 1e9f64;
+            let raw = (fdv_quote / supply) * 10f64.powi(dec_quote - TOKEN_DECIMALS as i32);
+            (raw.ln() / 1.0001f64.ln()).round() as i32
+        };
+        assert_eq!(point_for(1_000.0, NEAR_DECIMALS as i32), 0);
+        let usdc = point_for(4_300.0, 6);
+        assert!((-400_000..-399_000).contains(&usdc), "usdc point = {usdc}");
+        assert!(usdc < -390_000, "a USDC pair must not reuse the wNEAR point");
+
+        let wnear_top = (0i32.saturating_add(1_000_000)).min(POINT_MAX);
+        assert_eq!(wnear_top - 0, 500_000);
+        let naive_top = (usdc.saturating_add(1_000_000)).min(POINT_MAX);
+        assert!(naive_top - usdc > 600_000, "this is the overflow set_quote now refuses");
+        let safe = 450_000;
+        assert!((usdc.saturating_add(safe)).min(POINT_MAX) - usdc <= 550_000);
+    }
+
+    #[test]
+    fn a_deep_pair_point_never_reaches_the_power_helper() {
+        assert!(400_000u32 > POW_MAX_POINT);
+        assert!((pow_1_0001_fp(29_000) as f64 / 1e18 - 1.0001f64.powi(29_000)).abs() < 1e6);
+        assert_eq!(dev_buy_cap_yocto(-400_000, 10u128.pow(27), 0, 10_000), 0, "bps 0 must short-circuit before the power");
+    }
+
+    #[test]
     fn ordering_and_ranges() {
         let cfg = Config::default_mainnet();
         cfg.validate();
@@ -1404,4 +1528,8 @@ mod tests {
         let h = parse_hex32("7591d117dde58bba80a7df25ff6bd1112428f85cf20018d774f00b48af0fa11b");
         assert_eq!(hex32(h), "7591d117dde58bba80a7df25ff6bd1112428f85cf20018d774f00b48af0fa11b");
     }
+}
+
+fn house_key(a: &AccountId) -> Vec<u8> {
+    [b"xh:".as_slice(), a.as_bytes()].concat()
 }

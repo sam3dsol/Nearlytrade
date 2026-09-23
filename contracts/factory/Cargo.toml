@@ -3,6 +3,7 @@ name = "nearpad-factory"
 version = "0.2.0"
 edition = "2021"
 publish = false
+repository = "https://github.com/sam3dsol/NearlyTrade"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -14,7 +15,7 @@ near-sdk = { workspace = true }
 near-sdk = { workspace = true, features = ["unit-testing"] }
 
 [package.metadata.near.reproducible_build]
-image = "sourcescan/cargo-near:0.22.0-rust-1.96.0"
-image_digest = ""
+image = "sourcescan/cargo-near:0.22.0-rust-1.97.1"
+image_digest = "sha256:7467038bdddc86484b73b416eeadce926ff59013e128e53dec5a19e1cb4b2234"
 passed_env = []
 container_build_command = ["cargo", "near", "build", "non-reproducible-wasm", "--locked"]
