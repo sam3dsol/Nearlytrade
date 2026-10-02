@@ -1,0 +1,11 @@
+[package]
+name = "nearpad-token-tax-v2"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sys = "0.2"

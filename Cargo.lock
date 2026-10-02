@@ -1558,10 +1558,94 @@ dependencies = [
 ]
 
 [[package]]
-name = "nearpad-locker"
+name = "nearpad-locker-v1"
 version = "0.2.0"
 dependencies = [
  "near-sdk",
+]
+
+[[package]]
+name = "nearpad-locker-v2"
+version = "0.2.0"
+dependencies = [
+ "near-sdk",
+]
+
+[[package]]
+name = "nearpad-locker3"
+version = "0.3.0"
+dependencies = [
+ "near-sdk",
+]
+
+[[package]]
+name = "nearpad-locker3-lock-4"
+version = "0.3.0"
+dependencies = [
+ "near-sdk",
+]
+
+[[package]]
+name = "nearpad-locker3-lock3"
+version = "0.3.0"
+dependencies = [
+ "near-sdk",
+]
+
+[[package]]
+name = "nearpad-locker3-lock4"
+version = "0.3.0"
+dependencies = [
+ "near-sdk",
+]
+
+[[package]]
+name = "nearpad-token-raw"
+version = "0.1.0"
+dependencies = [
+ "near-sys",
+]
+
+[[package]]
+name = "nearpad-token-raw-v1"
+version = "0.1.0"
+dependencies = [
+ "near-sys",
+]
+
+[[package]]
+name = "nearpad-token-raw-v2"
+version = "0.1.0"
+dependencies = [
+ "near-sys",
+]
+
+[[package]]
+name = "nearpad-token-tax"
+version = "0.1.0"
+dependencies = [
+ "near-sys",
+]
+
+[[package]]
+name = "nearpad-token-tax-v1"
+version = "0.1.0"
+dependencies = [
+ "near-sys",
+]
+
+[[package]]
+name = "nearpad-token-tax-v2"
+version = "0.1.0"
+dependencies = [
+ "near-sys",
+]
+
+[[package]]
+name = "nearpad-token-tax-v3"
+version = "0.1.0"
+dependencies = [
+ "near-sys",
 ]
 
 [[package]]

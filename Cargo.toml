@@ -1,10 +1,26 @@
 [workspace]
 resolver = "2"
-members = ["contracts/factory", "contracts/locker"]
+members = [
+    "contracts/factory",
+    "contracts/locker3",
+    "contracts/token-raw",
+    "contracts/token-tax",
+    "legacy/locker-v1",
+    "legacy/locker-v2",
+    "legacy/locker3-lock3",
+    "legacy/locker3-lock4",
+    "legacy/locker3-lock_4",
+    "legacy/token-raw-v1",
+    "legacy/token-raw-v2",
+    "legacy/token-tax-v1",
+    "legacy/token-tax-v2",
+    "legacy/token-tax-v3",
+]
 
 [workspace.dependencies]
 near-sdk = "5.29.1"
 near-contract-standards = "5.29.1"
+
 
 [profile.release]
 codegen-units = 1

@@ -1,0 +1,83 @@
+# ContractWolf audit fixes
+
+Audited tree: commit dbb5ca5. Every change below is in this commit; line numbers are of the files at this commit.
+
+## Factory `contracts/factory/src/lib.rs`
+
+| Finding | Status | Lines | Change |
+|---|---|---|---|
+| TAX-SELLER-01 | Fixed | 1797-1812, 1839-1841, 1848-1853, 3374-3380, 453, 1968, 4445, 2715-2721 | `process_tax` requires `min_out` and keeps it as the slice's floor (`tf:` counter). `internal_tax_settle` refuses proceeds below `floor * sold / held` (exact 256-bit `mul_div_wide`, since floor and token counts are both ~1e22 on mainnet) and consumes that part of the floor. A slice that never reaches the seller takes its floor back (`on_tax_to_seller`; its new `floor` argument is optional so a slice in flight across the deploy still resolves). `get_tax` exposes `floor`. Owner `clear_tax_floor` for a slice whose market fell under its quote. |
+| RCW-015 | Fixed (refund) | 1068-1075 | `on_pool_checked`: a pool at another point refunds the refused `create_pool` deposit (0.1 NEAR) to the creator before the launch is marked failed. Account names stay as they are (the counter naming is a product choice); the squat now costs the attacker more than the creator. |
+| BUYBACK-EXCESS-01 | Fixed | 1722-1730 | `on_bb_after`: the part of the balance difference above 104% of `min_out` is booked to the launch's `creator_token_fees` (burn only for a burn launch) instead of staying outside every bucket. |
+| WNEAR-SWEEP-01 | Fixed | 1255-1268, 1289-1294, 1702-1707, 2316, 2656-2662, 2669-2713, 229, 4446-4451 | Every failed unwrap is booked to its launch (`wo:` creator, `wb:` buyback bucket) and counted in `uwt`, so `sweep_wnear` stays blocked. `release_dev_buy` moves a refused buy's record to `wo:` instead of dropping it; a late successful unwrap pays it once. New `get_wnear_owed`, `retry_wnear_owed` (anyone), `on_wnear_owed_unwrapped`. |
+| RCW-014 | Intended | 1757-1760 (doc) | Holder payouts are computed by the keeper off the holder index; the contract caps every round to what the launch earned for its holders. Kept as designed. |
+| ADMIN-KEY-01 | Operational | | No code change. After this build is live: owner methods move to function call keys (`add_fc_key`), the full access key is deleted. |
+| LOCKER-SUPPLY-01 (factory side) | Fixed | 2850-2861 | Owner `locker_release_supply(launch_id)` tells a lock_6 locker a failed launch's supply is a remainder. |
+| TAX-VENUE-01 (factory side) | Fixed | 2863-2873 | Owner `token_add_pair(launch_id, pair)` calls the token's `tax_add_pair`. |
+
+Tests: 137 pass (`cargo test`), new: `audit_the_sellers_proceeds_must_clear_the_keepers_floor_pro_rata` (5390), `audit_failed_unwraps_stay_owed_to_their_launch_and_a_retry_pays_them` (5289), `releasing_a_dev_buy_keeps_a_retried_unwrap_owed_to_the_creator` (7388), extended `the_buyback_credit_is_capped_at_104_percent_of_min_out` and `a_pool_at_another_price_fails_the_launch_and_frees_the_dev_buy`.
+
+## Locker `contracts/locker3/src/lib.rs` (deploys as a new account, lock_6)
+
+| Finding | Status | Lines | Change |
+|---|---|---|---|
+| LOCKER-SUPPLY-01 | Fixed | 327-331, 390, 447-452, 997-999, 1051-1061, 1276-1280, 1339-1340 | `supply_reserved[token]` is set on every HotZap send (`add`, `add_buy`, resend) and cleared when `record` books the position. `on_admin_asset` counts it as not free. Factory only `release_supply(token)` for a failed launch. View `get_supply_reserved`. |
+
+Tests: 64 pass (59 + 5 new, lines 1839-1888, 2526-2572 and the add_buy module).
+
+## Tax token `contracts/token-tax/src/lib.rs` (new global code for future launches; live tokens are immutable)
+
+| Finding | Status | Lines | Change |
+|---|---|---|---|
+| TAX-VENUE-01 | Fixed | 10-14, 19-20, 561-565, 598-601, 638, 792-824 | Admin only, add only `tax_add_pair`; `dcl_id` constant removed; auto registration of swap payouts now keys on any listed pair. |
+| MAXWALLET-PAYOUT-01 | Fixed | 520-524, 545-546, 644 | `check_max_wallet` never refuses a transfer from or into a listed pair (a payout follows a swap that already ran). |
+| TAX-LP-01 | Intended | | Liquidity flows stay taxed (else range orders trade tax free). The launch page and docs state it. |
+
+Sim: `sim/audit_fixes.mjs` 62 checks, `sim/tax_in_flight.mjs` 102, `sim/final_checks.mjs` 133, all pass.
+
+## Artifacts (recipes as in README.md)
+
+| File | Bytes | sha256 |
+|---|---|---|
+| artifacts/factory-auditfix.wasm | 624,090 | c427d8f602a472cca33c63f29026e1d43f2f00bee4ed1b48b60b9d87498380a6 |
+| artifacts/locker6.wasm | 287,321 | 0097d9a9244a763c992931682a01f86395f984a16043d06f43730cb923b535e5 |
+| artifacts/token-tax-v5.wasm | 21,568 | f4265f2230721b2df18a0d78f36b737fe77d955194519a77578b2463602ac3a4 |
+
+Keeper note: `process_tax` now needs a real `min_out` (the taxcrank already sends 97% of a fresh quote); the seller's own sale should use `max(own floor, get_tax.floor * amount / selling)` as its `min_output_amount` so a sale never settles below the floor.
+
+## Live on mainnet (2026-10-01, 21:05 to 21:20 UTC)
+
+| Contract | Account | Code hash (base58) | sha256 | Tx |
+|---|---|---|---|---|
+| Factory | nearlytrade.near | 8dJzWRwu3yvt8zoKauAD8FeqadG1U4zToQeyDqPN6U65 (2026-10-02 19:02 UTC, final build; before it 7DxV8GDC… = 5c77d409 tax_return from ~11:00 UTC, HrNxUUji… = fa6146d5 from ~09:0x UTC tx 2ouURYue…, jxdDdqoj… = 0b0149eb for ~1.5 h, 5Uux4bxF… = 42954cb0 from 05:1x UTC, and the audit-fix code ECi9hvT5… = c427d8f6 from 2026-10-01 21:08 UTC) | 714f0f8847009ec6289b8aea9f096a2259598da294cc7761a129bace9dca84ca | Ejp7RVPL6z37G12L3daUUTAYVYsofbZG6TDBLjLmYbUG (deploy); pots set in EbefPH5N… (referralpot.near) and 9ceXJrEe… (burnpot.near) |
+| Locker (launches from #2192) | lock_6.nearlytrade.near | 13KJEWasGi6jrk3X99FDqeCbZ3Uqdpbbkd27fzSkx4Ut | 0097d9a9244a763c992931682a01f86395f984a16043d06f43730cb923b535e5 | created in the same run, 0 access keys |
+| Tax token v5 (global code, tax launches from the switch on) | published by nearlyops.near | HS4R2isPS7hnnY8k2QbxnLHUx9Z9v9mNZnLsrGqwhChh | f4265f2230721b2df18a0d78f36b737fe77d955194519a77578b2463602ac3a4 | DuDAZFmo36G3HJhQSoydcepo8ogRrUPwNtPAs4VMSijp (publish), BcBUzpJjaQzdq1ToCScXBzi7mJg871UvCgTAxA93pDyk (factory switch) |
+
+Earlier launches keep their lockers (lock to lock_5) and token codes, as before. The TAX-LP-01 note is live on nearly.trade/docs#tax and on the launch page.
+
+## Withdrawn (2026-10-02): launches paying their own record
+
+Built and tested (factory wasm `2431d3c5…`, repo commit a81f0be) but not deployed: the launch price stays as it was (0.16 NEAR plain, about 0.27 with a logo). The code was removed again in the next commit; the factory's own storage for new launches is instead cut by the change below.
+
+## Follow-up (2026-10-02): the logo lives on the token only
+
+`on_created` drops the icon from the factory's launch record once the token exists (the token's `ft_metadata.icon`, NEP-148, is where wallets, Rhea and explorers read it); the record keeps only the icon's length under the raw key `il:` so a retry still prices the token storage. Existing launches keep their stored icons. Lines: `contracts/factory/src/lib.rs` `icon_len_key` / `icon_len_of` helpers next to `wnear_retry_key`, `on_created` after the token-create error branch, `resume` and the create-error path use `icon_len_of`. Test `the_icon_stays_in_the_factory_record_and_goes_to_the_token_as_live` updated. Factory wasm `42954cb0788507f28eb67f53094f89714407a02b40dafd7905550484a69a331b` (624,369 bytes). The site's indexer takes a missing logo from the token's metadata.
+
+## Follow-up (2026-10-02): the fee split is 70 / 20 / 5 / 5
+
+Not an audit finding. Every launch from this build on splits its pool fee four ways, written into the launch at creation (the existing per-launch `launch_recipients`), never changed after: 70% creator (`MIN_CREATOR_SHARE_BPS` = `MAX_CREATOR_SHARE_BPS` = 7,000, the only value `set_config` accepts; a launch may not carry another), 20% protocol recipients (`PROTOCOL_BPS`), 5% burn pot (`BURN_POT_BPS`, owner `set_burn_pot`), 5% referral pot (`REFERRAL_POT_BPS`, owner `set_referral_pot`); a compile time assert keeps the four at 10,000. A new tax launch's tax splits the same four ways: the creator's side keeps 70% (split creator / burn / holders as the creator chose), 20% protocol, 5% burn pot, 5% referral pot; the non-creator 30% is stored in the field that has always been called `platform_bps` (`PLATFORM_TAX_BPS` = 3,000, which is `PROTOCOL_BPS + BURN_POT_BPS + REFERRAL_POT_BPS`) and routes through the same per-launch recipients. A pot that is not set leaves its part with the protocol. There is no per-launch referrer: the earlier `LaunchArgs.referrer` (deployed for about two hours as `jxdDdqoj…`) is removed; the few launches made with it keep the recipients they were created with. Launches before 2026-10-02 keep their stored 80 / 20 and 20% tax cut. Lines: constants after `TOKEN_BASE_STORAGE_BYTES`, `MIN/MAX_CREATOR_SHARE_BPS`, `PLATFORM_TAX_BPS`; `pot_recipients` in `impl Factory` before `internal_set_launch_recipients`; `launch` after the record insert (`launch_split` event); `internal_tax_distribute` native branch; `set_burn_pot` / `set_referral_pot` before `set_tax_seller`. Test `every_new_launch_splits_its_fee_70_20_5_5_and_the_creator_cannot_pick`. Factory wasm `fa6146d59b8e9d10a5a66c32bfc5c8845bf2b1fa2ff7ea92b62f565cd7cb18f3` (629,747 bytes).
+
+## Follow-up (2026-10-02): an unsold tax slice can come back
+
+Closes the one manual step the TAX-SELLER-01 fix left: when a token's market falls under the floor a slice was handed over with, the seller cannot settle it and the owner had to `clear_tax_floor`. Now the seller hands the slice back instead: `ft_on_transfer` accepts the launch's own token from the tax seller with msg `{"tax_return": <id>}` (at most what the seller holds for that launch; refused in full for any other sender, amount or while the token is swap-locked), moves it back to pending, drops its pro rata part of the floor, emits `tax_returned`; the next `process_tax` quotes it fresh. The keeper does this automatically when its sale quote is under the floor. `clear_tax_floor` stays as a spare. Lines: `ft_on_transfer` (the `tax_return` branch before the `tax_proceeds` parse). Test: the `TXR` block in `audit_the_sellers_proceeds_must_clear_the_keepers_floor_pro_rata`. Factory wasm `5c77d4090e0bcf400adb16a67f9c22e37b5a7d1b09c3768f2ef4b9c6ebd56b8d` (630,460 bytes).
+
+## Follow-up (2026-10-02): final factory build
+
+Deployed 2026-10-02 19:02 UTC in tx `Ejp7RVPL6z37G12L3daUUTAYVYsofbZG6TDBLjLmYbUG`, code `714f0f88…` (base58 `8dJzWRwu…`), no state migration. Rebuild: `(cd contracts/factory && cargo near build non-reproducible-wasm --locked --no-abi)`. Four changes:
+
+1. **Holders mode on every pair.** The launch no longer refuses `fee_mode: "holders"` on a pair asset. On a pair launch the creator's 70% of the quote side is banked in the launch's holders bucket in the pair token (it used to go to `creator_quote_fees`), and `pay_holders` pays it in that token, 10 lines a call, each leg registering the holder first; a leg that bounces is owed to that holder in the same token (`push_owed`). NEAR pair holders launches are unchanged. A creator tax share on a pair still needs fee mode creator.
+2. **Buyback excess is reported, not booked.** `on_bb_after` caps what it burns at 104% of `min_out` as before; anything above the cap (a refund or another transfer landing in the window, already counted in its own bucket) is now only reported with `buyback_excess_ignored` and never credited to `creator_token_fees`.
+3. **Pot checks.** `set_burn_pot` and `set_referral_pot` refuse the factory's own account. `set_protocol_recipients`, `set_burn_pot` and `set_referral_pot` refuse any combination where protocol recipients plus pots exceed the 4 legs a launch split carries; `pot_recipients` emits `pot_legs_dropped` if it ever falls back.
+4. **Tickers up to 12 characters** (`symbol: 1-12 chars`).
+
+Tests: 141 pass (`cargo test -p nearpad-factory`), new: `a_holders_launch_on_a_pair_banks_and_pays_its_holders_in_the_pair_token`, `a_pair_holders_launch_with_a_creator_tax_share_is_still_refused`, `pots_refuse_the_launchpad_and_a_split_that_would_not_fit`, extended `the_buyback_credit_is_capped_at_104_percent_of_min_out`. Mainnet check after the deploy: test launches in every fee mode on NEAR, DIARHEA, NINU, RHEA, USDC, ZEC and a stock pair, each with a buy, a sell and a claim, plus a burn-mode buyback, a NEAR holders payout and a DIARHEA holders payout.
