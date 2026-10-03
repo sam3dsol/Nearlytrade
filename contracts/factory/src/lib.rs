@@ -24,8 +24,8 @@ const TOKEN_BASE_STORAGE_BYTES: u128 = 3_000;
 
 
 const PROTOCOL_BPS: u16 = 2_000;
-const BURN_POT_BPS: u16 = 500;
-const REFERRAL_POT_BPS: u16 = 500;
+const BURN_POT_BPS: u16 = 0;
+const REFERRAL_POT_BPS: u16 = 1_000;
 const _: () = assert!(7_000 + PROTOCOL_BPS + BURN_POT_BPS + REFERRAL_POT_BPS == 10_000, "the four parts make the whole fee");
 
 const BURN_POT_KEY: &[u8] = b"bpt";
@@ -5284,7 +5284,7 @@ mod v6_tests {
     }
 
     #[test]
-    fn every_new_launch_splits_its_fee_70_20_5_5_and_the_creator_cannot_pick() {
+    fn every_new_launch_splits_its_fee_70_20_10_and_the_creator_cannot_pick() {
         let mut f = factory();
         owner();
         f.set_protocol_recipients(vec![(acct("p1.near"), 5000), (acct("p2.near"), 5000)]);
@@ -5298,14 +5298,14 @@ mod v6_tests {
         f.set_referral_pot(Some(acct("refpot.near")));
         assert_eq!((f.get_burn_pot(), f.get_referral_pot()), (Some(acct("burn.near")), Some(acct("refpot.near"))));
         let id1 = launch_scheduled(&mut f, "alice.near", args("FOUR"));
-        assert_eq!(f.get_launch_recipients(U64(id1)).unwrap(), vec![(acct("p1.near"), 3334), (acct("p2.near"), 3334), (acct("burn.near"), 1666), (acct("refpot.near"), 1666)]);
+        assert_eq!(f.get_launch_recipients(U64(id1)).unwrap(), vec![(acct("p1.near"), 3333), (acct("p2.near"), 3334), (acct("refpot.near"), 3333)]);
         assert!(logs_with("launch_split")[0].contains(r#""recipients""#));
         assert_eq!(fee_opts(id1, 8000), (FM_CREATOR, 7000), "70% stored for the launch");
 
         owner();
         f.set_referral_pot(None);
         let id2 = launch_scheduled(&mut f, "alice.near", args("ONEPOT"));
-        assert_eq!(f.get_launch_recipients(U64(id2)).unwrap(), vec![(acct("p1.near"), 4167), (acct("p2.near"), 4167), (acct("burn.near"), 1666)]);
+        assert_eq!(f.get_launch_recipients(U64(id2)).unwrap(), vec![(acct("p1.near"), 5000), (acct("p2.near"), 5000)]);
 
         ctx("bob.near", f.quote_launch(0, None, None).total.0);
         assert_eq!(panics(|| drop(f.launch(LaunchArgs { creator_share_bps: Some(8000), ..args("PICK") }))), "creator_share_bps: the launchpad's current share, or leave it out");
@@ -5591,7 +5591,7 @@ mod v6_tests {
         f.set_protocol_recipients(vec![(acct("p1.near"), 5000), (acct("p2.near"), 5000)]);
         owner();
         f.set_referral_pot(Some(acct("refpot.near")));
-        assert_eq!(f.pot_recipients(7000).unwrap().len(), 4);
+        assert_eq!(f.pot_recipients(7000).unwrap().len(), 3);
 
         owner();
         f.set_burn_pot(None);
