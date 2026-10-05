@@ -870,13 +870,26 @@ impl Locker {
         let (q_ok, t_ok) = (arrived(wq.0), arrived(wt.0));
         let q = self.quote_asset(&quote);
         if probed == Some(true) {
+            let read = env::promise_result_checked(i, 4096).ok()
+                .and_then(|b| near_sdk::serde_json::from_slice::<near_sdk::serde_json::Value>(&b).ok());
+            match read {
+                Some(v) => {
+                    let bps = buy_tax_bps(&v, env::current_account_id().as_str(), self.dcl.as_str(), q.as_str());
+                    self.quote_tax.insert(self.tax_key(&q), bps);
+                    emit("quote_tax_read", &format!(r#"{{"quote":"{}","buy_bps":{}}}"#, q, bps));
+                }
 
 
-            let bps = env::promise_result_checked(i, 4096).ok()
-                .and_then(|b| near_sdk::serde_json::from_slice::<near_sdk::serde_json::Value>(&b).ok())
-                .map_or(0, |v| buy_tax_bps(&v, env::current_account_id().as_str(), self.dcl.as_str(), q.as_str()));
-            self.quote_tax.insert(self.tax_key(&q), bps);
-            emit("quote_tax_read", &format!(r#"{{"quote":"{}","buy_bps":{}}}"#, q, bps));
+
+                None if self.launchpad_token(&q) => {
+                    emit("quote_tax_unknown", &format!(r#"{{"quote":"{}"}}"#, q));
+                }
+
+                None => {
+                    self.quote_tax.insert(self.tax_key(&q), 0);
+                    emit("quote_tax_read", &format!(r#"{{"quote":"{}","buy_bps":0}}"#, q));
+                }
+            }
         }
         let (was, mut c) = self.carry_for(&token, &quote);
         let (q_left, q_dcl) = settle_withdrawal(q_ok, wq.0);
@@ -1150,6 +1163,11 @@ impl Locker {
     /// The factory parks a launch whose add is refused, and a refused claim moves nothing.
     fn assert_funded(&self) {
         require!(free_balance() >= MIN_FREE, "locker NEAR low: top up");
+    }
+
+    /// A token this launchpad made (a sub-account of the factory): the only kind that can carry its tax.
+    fn launchpad_token(&self, asset: &AccountId) -> bool {
+        asset.as_str().strip_suffix(self.factory.as_str()).map_or(false, |head| head.ends_with('.'))
     }
 
     /// `quote_tax` key: the exchange this account talks to, then the asset
@@ -2312,6 +2330,36 @@ mod claim_tests {
         }
         assert_eq!(buy_tax_bps(&near_sdk::serde_json::json!({"tax": {"buy_bps": 200, "pairs": [DCL], "admin": "a", "exempt": []}}), "ninu.near", DCL, "ninu.near"), 0, "the token itself");
         assert_eq!(buy_tax_bps(&near_sdk::serde_json::json!({"tax": {"buy_bps": "150", "pairs": [DCL], "admin": "a"}}), me, DCL, "t.near"), 150, "a string bps, no exempt list");
+    }
+
+    /// NEAR Legion review (10-04): a failed or unreadable tax view of a token of this launchpad is not
+    /// cached as no tax; nothing of that quote is withdrawn, and the next claim reads it again.
+    #[test]
+    fn a_failed_tax_read_of_a_launchpad_token_is_read_again() {
+        for (q, result) in [(ninu(), PromiseResult::Failed), ("diarhea.nearlytrade.near".parse::<AccountId>().unwrap(), ok(b"not json"))] {
+            cb(vec![]);
+            let mut l = Locker::new("nearlytrade.near".parse().unwrap(), DCL.parse().unwrap(), wrap());
+            cb(vec![]);
+            drop(claimed(&mut l, cat(), true, Some(q.clone()), vec![U128(0), U128(10_000)]));
+            cb(vec![result]);
+            drop(l.on_withdrawn(cat(), true, Some(q.clone()), U128(0), U128(0), Some(true)));
+            assert_eq!(l.get_quote_tax(q.clone()), None, "unknown, not 0");
+            assert_eq!(l.get_carry(cat()).quote_held.0, 0, "nothing booked");
+            assert_eq!(l.get_dcl_reserved(q.clone()).0, 10_000, "still at the exchange");
+
+            cb(vec![]);
+            drop(claimed(&mut l, cat(), true, Some(q.clone()), vec![U128(0), U128(0)]));
+            assert_eq!(names(), vec!["get_tax", "on_withdrawn"]);
+            cb(vec![ok(&tax_json(200, &[], "nearlytrade.near", &[DCL]))]);
+            drop(l.on_withdrawn(cat(), true, Some(q.clone()), U128(0), U128(0), Some(true)));
+            assert_eq!(l.get_quote_tax(q.clone()), Some(200));
+        }
+
+        let l = Locker::new("nearlytrade.near".parse().unwrap(), DCL.parse().unwrap(), wrap());
+        assert!(l.launchpad_token(&ninu()));
+        assert!(!l.launchpad_token(&"nearlytrade.near".parse().unwrap()));
+        assert!(!l.launchpad_token(&"evilnearlytrade.near".parse().unwrap()));
+        assert!(!l.launchpad_token(&usdc()));
     }
 
     /// The token's own formula, on the edges: rounded down, capped at 400, and the overflow branch.

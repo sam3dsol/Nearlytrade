@@ -66,6 +66,22 @@ const BYTE_COST: u128 = 10_000_000_000_000_000_000;
 
 const AUTO_REG_MARGIN: u128 = REG_COST;
 
+fn paid_record_cost(a: &[u8]) -> u128 {
+    (40 + 1 + a.len() as u128 + 16) * BYTE_COST
+}
+
+
+fn unbacked() -> u128 {
+    sread(b"u").map_or(0, |v| {
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&v[..16]);
+        u128::from_le_bytes(b)
+    })
+}
+fn set_unbacked(n: u128) {
+    swrite(b"u", &n.to_le_bytes());
+}
+
 fn reg(r: u64) -> Vec<u8> {
     unsafe {
         let len = sys::register_len(r);
@@ -529,10 +545,11 @@ fn dcl_id(me: &[u8]) -> &'static [u8] {
 
 
 
+
 fn auto_register(to: &[u8]) -> bool {
 
     let bytes = unsafe { sys::storage_usage() } as u128 + 40 + 1 + to.len() as u128 + 17;
-    if account_balance() < bytes * BYTE_COST + AUTO_REG_MARGIN {
+    if account_balance() < bytes * BYTE_COST + AUTO_REG_MARGIN + unbacked() {
         return false;
     }
     let mut v = [0u8; 17];
@@ -736,16 +753,19 @@ pub extern "C" fn ft_resolve_transfer() {
 
 
     let unused = unused_of_receiver().map_or(amount, |n| n.min(amount));
-    let mut refund = 0u128;
+
+
+    let mut returned = 0u128;
     if unused > 0 {
         let rb = balance(receiver).unwrap_or(0);
-        refund = unused.min(rb);
+        let refund = unused.min(rb);
         if refund > 0 {
             set_balance(receiver, rb - refund);
             match balance(sender) {
                 Some(sb) => {
                     set_balance(sender, sb + refund);
                     ev_transfer(receiver, sender, refund, Some(b"refund"));
+                    returned = refund;
                 }
                 None => {
                     set_supply(supply() - refund);
@@ -755,7 +775,7 @@ pub extern "C" fn ft_resolve_transfer() {
         }
     }
     let mut o = Buf::new();
-    o.qn(amount - refund);
+    o.qn(amount - returned);
     ret(&o.0);
 }
 
@@ -799,6 +819,7 @@ pub extern "C" fn storage_deposit() {
             die("The attached deposit is less than the minimum storage balance");
         }
         set_balance(&account, 0);
+        set_unbacked(unbacked() + REG_COST.saturating_sub(paid_record_cost(&account)));
         if dep > REG_COST {
             transfer_near(&pred, dep - REG_COST);
         }
@@ -854,6 +875,9 @@ pub extern "C" fn storage_unregister() {
             }
 
             let auto = is_auto(&who);
+            if !auto {
+                set_unbacked(unbacked().saturating_sub(REG_COST.saturating_sub(paid_record_cost(&who))));
+            }
             sremove(&bal_key(&who));
             transfer_near(&who, if auto { 1 } else { REG_COST + 1 });
             ret(b"true");

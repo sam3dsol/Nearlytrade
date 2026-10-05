@@ -94,6 +94,9 @@ const GAS_BURN: Gas = Gas::from_tgas(10);
 
 const GAS_ON_SPLIT: Gas = Gas::from_tgas(4);
 
+
+const GAS_OWED_CB: Gas = Gas::from_tgas(20);
+
 const GAS_CB_MIN: Gas = Gas::from_tgas(8);
 
 const GAS_RESERVE: Gas = Gas::from_tgas(10);
@@ -240,7 +243,9 @@ const MAX_FEE_ROUTERS: usize = 32;
 
 const STUCK_LAUNCH_MS: u64 = 24 * 60 * 60 * 1000;
 
-const WNEAR_RETRY_MS: u64 = 10 * 60 * 1000;
+
+
+const UNWRAP_RESOLVE_MS: u64 = 30 * 60 * 1000;
 
 const MAX_HOLDER_PAYOUTS: usize = 25;
 const MAX_FT_HOLDER_PAYOUTS: usize = 10;
@@ -256,7 +261,7 @@ const PLATFORM_TAX_BPS: u16 = PROTOCOL_BPS + BURN_POT_BPS + REFERRAL_POT_BPS;
 const TAX_EXTRA_BYTES: u128 = 600;
 
 
-const MAX_TEXT_BYTES: usize = 32 * 4 + 10 + 500 * 4;
+const MAX_TEXT_BYTES: usize = 32 * 4 + 12 + 500 * 4;
 
 
 #[derive(BorshStorageKey)]
@@ -918,7 +923,7 @@ impl Factory {
                 let mut l = l;
                 l.inflight = true;
                 self.launches.insert(launch_id.0, l);
-                return self.unwrap_wnear(w).then(Self::ext(env::current_account_id()).with_static_gas(GAS_DEV_UNWRAPPED).on_dev_buy_unwrapped(launch_id.0));
+                return self.dev_buy_unwrap(launch_id.0, w, 1);
             }
         }
 
@@ -1247,10 +1252,7 @@ impl Factory {
                     l.inflight = true;
                     self.launches.insert(id, l);
                 }
-                PromiseOrValue::Promise(
-                    self.unwrap_wnear(amount)
-                        .then(Self::ext(env::current_account_id()).with_static_gas(GAS_DEV_UNWRAPPED).with_unused_gas_weight(0).on_dev_buy_unwrapped(id)),
-                )
+                PromiseOrValue::Promise(self.dev_buy_unwrap(id, amount, 0))
             }
             Err(_) => {
                 if l.step == Step::Done {
@@ -1272,11 +1274,43 @@ impl Factory {
 
 
 
+
+
+
     #[private]
-    pub fn on_dev_buy_unwrapped(&mut self, id: u64, #[callback_result] r: Result<(), PromiseError>) -> bool {
+    pub fn on_dev_buy_unwrapped(&mut self, id: u64, op: Option<u64>, #[callback_result] r: Result<(), PromiseError>) -> bool {
+        let mark = read_u128(&dev_unwrap_op_key(id)).map(|v| v as u64);
+        if op != mark {
+            emit("dev_buy_unwrap_stale", &format!(r#"{{"id":{},"op":"{}","ok":{}}}"#, id, op.unwrap_or(0), r.is_ok()));
+            return false;
+        }
+        env::storage_remove(&dev_unwrap_op_key(id));
+        self.internal_dev_buy_unwrapped(id, r.is_ok(), op.is_none())
+    }
+
+
+
+    fn internal_dev_buy_unwrapped(&mut self, id: u64, ok: bool, legacy: bool) -> bool {
         let mut l = self.rec(id);
-        let ok = r.is_ok();
         let prev = read_u128(&unwrap_pending_key(id)).unwrap_or(0);
+        if l.step == Step::Done && !legacy {
+
+
+            let amount = l.dev_buy_near.0;
+            env::storage_remove(&unwrap_pending_key(id));
+            if ok {
+                sub_counter(UW_TOTAL_KEY, prev);
+                emit("dev_buy_refunded", &format!(r#"{{"id":{},"creator":"{}","amount":"{}"}}"#, id, l.creator, amount));
+                self.internal_refund_creator(id, &l.creator, amount).detach();
+            } else {
+
+                add_counter(&wnear_owed_key(id), amount);
+                add_counter(UW_TOTAL_KEY, amount);
+                sub_counter(UW_TOTAL_KEY, prev);
+                emit("dev_buy_unwrap_failed", &format!(r#"{{"id":{},"amount":"{}","released":true}}"#, id, amount));
+            }
+            return ok;
+        }
         if l.step == Step::Done {
 
 
@@ -1800,8 +1834,11 @@ impl Factory {
 
 
 
+
+
     pub fn collect_tax(&mut self, launch_id: U64) -> Promise {
         self.assert_not_paused();
+        self.assert_keeper();
         require!(tax_opts(launch_id.0).is_some(), "no tax on this launch");
         let l = self.rec(launch_id.0);
         require!(l.step == Step::Done, "launch not live");
@@ -2782,12 +2819,15 @@ impl Factory {
         require!(l.inflight || !env::storage_has_key(&unwrap_pending_key(id)), "resume unwraps the refused buy first");
 
 
-        let uw = read_u128(&unwrap_pending_key(id)).unwrap_or(0);
+
+
+        let unwrapping = env::storage_has_key(&dev_unwrap_op_key(id));
+        let uw = if unwrapping { 0 } else { read_u128(&unwrap_pending_key(id)).unwrap_or(0) };
         if uw > 0 {
             env::storage_remove(&unwrap_pending_key(id));
             add_counter(&wnear_owed_key(id), uw);
         }
-        emit("dev_buy_released", &format!(r#"{{"id":{},"creator":"{}","amount":"{}","unwrap_pending":"{}","locker_held":"{}"}}"#, id, l.creator, l.dev_buy_near.0, uw, buy_held(id)));
+        emit("dev_buy_released", &format!(r#"{{"id":{},"creator":"{}","amount":"{}","unwrap_pending":"{}","unwrapping":{},"locker_held":"{}"}}"#, id, l.creator, l.dev_buy_near.0, uw, unwrapping, buy_held(id)));
         self.internal_done(id, l);
     }
 
@@ -2802,39 +2842,75 @@ impl Factory {
 
 
 
+
+
     pub fn retry_wnear_owed(&mut self, launch_id: U64) -> Promise {
         let id = launch_id.0;
         let _ = self.rec(id);
         let (owed, bucket) = (read_counter(&wnear_owed_key(id)), read_counter(&wnear_owed_bucket_key(id)));
         require!(owed + bucket > 0, "nothing owed to this launch");
-
-        let since = read_u128(&wnear_retry_key(id)).unwrap_or(0) as u64;
-        require!(env::block_timestamp_ms() >= since.saturating_add(WNEAR_RETRY_MS), "retry in flight");
-        env::storage_write(&wnear_retry_key(id), &(env::block_timestamp_ms() as u128).to_le_bytes());
+        require!(!env::storage_has_key(&wnear_retry_key(id)), "retry in flight");
+        require!(!env::storage_has_key(&dev_unwrap_op_key(id)), "the dev buy's unwrap is in flight");
+        require!(gas_left() >= GAS_UNWRAP.saturating_add(GAS_OWED_CB).saturating_add(GAS_RESERVE), "attach at least 50 TGas");
+        let op = env::block_timestamp_ms();
+        env::storage_write(&wnear_retry_key(id), &[op.to_le_bytes().as_slice(), &owed.to_le_bytes(), &bucket.to_le_bytes()].concat());
         self.unwrap_wnear(owed + bucket)
-            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_ON_SPLIT).with_unused_gas_weight(1).on_wnear_owed_unwrapped(launch_id, U128(owed), U128(bucket)))
+            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_OWED_CB).with_unused_gas_weight(0).on_wnear_owed_unwrapped(launch_id, U128(owed), U128(bucket), Some(op)))
     }
 
+
+
     #[private]
-    pub fn on_wnear_owed_unwrapped(&mut self, launch_id: U64, owed: U128, bucket: U128, #[callback_result] r: Result<(), PromiseError>) -> bool {
+    pub fn on_wnear_owed_unwrapped(&mut self, launch_id: U64, owed: U128, bucket: U128, op: Option<u64>, #[callback_result] r: Result<(), PromiseError>) -> bool {
         let id = launch_id.0;
-        env::storage_remove(&wnear_retry_key(id));
-        if r.is_err() {
-            emit("wnear_owed_unwrap_failed", &format!(r#"{{"id":{},"amount":"{}"}}"#, id, owed.0 + bucket.0));
+        if op.is_some() && op != wnear_retry(id).map(|w| w.0) {
+            emit("wnear_owed_unwrap_stale", &format!(r#"{{"id":{},"op":"{}","ok":{}}}"#, id, op.unwrap_or(0), r.is_ok()));
             return false;
         }
-        sub_counter(&wnear_owed_key(id), owed.0);
-        sub_counter(&wnear_owed_bucket_key(id), bucket.0);
-        sub_counter(UW_TOTAL_KEY, owed.0 + bucket.0);
-        emit("wnear_owed_paid", &format!(r#"{{"id":{},"creator":"{}","bucket":"{}"}}"#, id, owed.0, bucket.0));
-        if owed.0 > 0 {
-            let creator = self.rec(id).creator;
-            self.internal_refund_creator(id, &creator, owed.0).detach();
+        env::storage_remove(&wnear_retry_key(id));
+        self.internal_wnear_owed_unwrapped(id, owed.0, bucket.0, r.is_ok())
+    }
+
+    fn internal_wnear_owed_unwrapped(&mut self, id: u64, owed: u128, bucket: u128, ok: bool) -> bool {
+        if !ok {
+            emit("wnear_owed_unwrap_failed", &format!(r#"{{"id":{},"amount":"{}"}}"#, id, owed + bucket));
+            return false;
         }
-        if bucket.0 > 0 {
-            self.internal_bb_recredit(launch_id, bucket.0);
+        sub_counter(&wnear_owed_key(id), owed);
+        sub_counter(&wnear_owed_bucket_key(id), bucket);
+        sub_counter(UW_TOTAL_KEY, owed + bucket);
+        emit("wnear_owed_paid", &format!(r#"{{"id":{},"creator":"{}","bucket":"{}"}}"#, id, owed, bucket));
+        if owed > 0 {
+            let creator = self.rec(id).creator;
+            self.internal_refund_creator(id, &creator, owed).detach();
+        }
+        if bucket > 0 {
+            self.internal_bb_recredit(U64(id), bucket);
         }
         true
+    }
+
+
+
+
+
+    pub fn resolve_unwrap(&mut self, launch_id: U64, landed: bool) -> bool {
+        self.assert_owner();
+        let id = launch_id.0;
+        let now = env::block_timestamp_ms();
+        if let Some(op) = read_u128(&dev_unwrap_op_key(id)).map(|v| v as u64) {
+            require!(now >= op.saturating_add(UNWRAP_RESOLVE_MS), "unwrap in flight: its callback settles it");
+            env::storage_remove(&dev_unwrap_op_key(id));
+            emit("unwrap_resolved", &format!(r#"{{"id":{},"kind":"dev_buy","op":"{}","landed":{}}}"#, id, op, landed));
+            return self.internal_dev_buy_unwrapped(id, landed, false);
+        }
+        let retry = wnear_retry(id);
+        require!(retry.is_some(), "no unwrap in flight for this launch");
+        let (op, owed, bucket) = retry.unwrap();
+        require!(now >= op.saturating_add(UNWRAP_RESOLVE_MS), "unwrap in flight: its callback settles it");
+        env::storage_remove(&wnear_retry_key(id));
+        emit("unwrap_resolved", &format!(r#"{{"id":{},"kind":"owed","op":"{}","landed":{}}}"#, id, op, landed));
+        self.internal_wnear_owed_unwrapped(id, owed, bucket, landed)
     }
 
 
@@ -2988,10 +3064,13 @@ impl Factory {
 
 
 
+
+
     pub fn token_add_pair(&mut self, launch_id: U64, pair: AccountId) -> Promise {
         self.assert_owner();
         let l = self.rec(launch_id.0);
         require!(tax_opts(launch_id.0).is_some(), "no tax on this launch");
+        require!(!self.quotes.contains_key(&l.token), "a quote asset's pairs stay as the lockers read them");
         emit("token_add_pair", &format!(r#"{{"id":{},"token":"{}","pair":"{}"}}"#, launch_id.0, l.token, pair));
         Promise::new(l.token)
             .function_call("tax_add_pair".to_string(), format!(r#"{{"pair":"{}"}}"#, pair).into_bytes(), NO_DEPOSIT, GAS_ON_SPLIT)
@@ -3452,6 +3531,15 @@ impl Factory {
 
     fn unwrap_wnear(&self, amount: u128) -> Promise {
         Promise::new(self.wnear_id.clone()).function_call("near_withdraw".to_string(), format!(r#"{{"amount":"{}"}}"#, amount).into_bytes(), ONE_YOCTO, GAS_UNWRAP)
+    }
+
+
+
+    fn dev_buy_unwrap(&self, id: u64, amount: u128, weight: u64) -> Promise {
+        let op = env::block_timestamp_ms();
+        env::storage_write(&dev_unwrap_op_key(id), &(op as u128).to_le_bytes());
+        self.unwrap_wnear(amount)
+            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_DEV_UNWRAPPED).with_unused_gas_weight(weight).on_dev_buy_unwrapped(id, Some(op)))
     }
 
     fn assert_not_paused(&self) {
@@ -4580,7 +4668,18 @@ fn wnear_owed_key(id: u64) -> Vec<u8> { [b"wo:".as_slice(), &id.to_le_bytes()].c
 
 fn wnear_owed_bucket_key(id: u64) -> Vec<u8> { [b"wb:".as_slice(), &id.to_le_bytes()].concat() }
 
+
 fn wnear_retry_key(id: u64) -> Vec<u8> { [b"wi:".as_slice(), &id.to_le_bytes()].concat() }
+
+fn wnear_retry(id: u64) -> Option<(u64, u128, u128)> {
+    let v = env::storage_read(&wnear_retry_key(id))?;
+    if v.len() == 40 {
+        return Some((u64::from_le_bytes(v[..8].try_into().unwrap()), u128::from_le_bytes(v[8..24].try_into().unwrap()), u128::from_le_bytes(v[24..].try_into().unwrap())));
+    }
+    Some((u128::from_le_bytes(v.try_into().expect("u128")) as u64, read_counter(&wnear_owed_key(id)), read_counter(&wnear_owed_bucket_key(id))))
+}
+
+fn dev_unwrap_op_key(id: u64) -> Vec<u8> { [b"uf:".as_slice(), &id.to_le_bytes()].concat() }
 
 
 fn icon_len_key(id: u64) -> Vec<u8> { [b"il:".as_slice(), &id.to_le_bytes()].concat() }
@@ -4703,6 +4802,10 @@ mod v6_tests {
             None,
         )
     }
+
+    pub(super) fn uw_op(id: u64) -> Option<u64> { read_u128(&dev_unwrap_op_key(id)).map(|v| v as u64) }
+
+    pub(super) fn retry_op(id: u64) -> Option<u64> { wnear_retry(id).map(|w| w.0) }
     pub(super) fn ctx(who: &str, deposit: u128) {
         ctx_at(who, deposit, 1_700_000_000_000);
     }
@@ -4977,7 +5080,7 @@ mod v6_tests {
         assert!(l(&f, id).inflight, "held in flight while the unwrap runs");
         assert_eq!(l(&f, id).dev_buy_held.0, 0);
         ctx(ME, 0);
-        assert!(!f.on_dev_buy_unwrapped(id, Err(PromiseError::Failed)));
+        assert!(!f.on_dev_buy_unwrapped(id, uw_op(id), Err(PromiseError::Failed)));
         assert_eq!(l(&f, id).dev_buy_held.0, 0, "an unwrap that failed re-credits nothing");
         assert!(!l(&f, id).inflight);
 
@@ -4990,7 +5093,7 @@ mod v6_tests {
         assert!(c.iter().any(|c| c.1 == "near_withdraw" && c.2.contains(&format!(r#""amount":"{}""#, near))));
         assert!(c.iter().all(|c| c.1 != "ft_transfer_call"), "no swap while the wNEAR is not back");
         ctx(ME, 0);
-        assert!(f.on_dev_buy_unwrapped(id, Ok(())));
+        assert!(f.on_dev_buy_unwrapped(id, uw_op(id), Ok(())));
         assert_eq!(l(&f, id).dev_buy_held.0, near, "funded again once the unwrap landed");
         assert!(!env::storage_has_key(&unwrap_pending_key(id)));
 
@@ -5000,7 +5103,7 @@ mod v6_tests {
         ctx(ME, 0);
         let _ = f.on_dev_bought(id2, Ok(U128(0)));
         ctx(ME, 0);
-        assert!(f.on_dev_buy_unwrapped(id2, Ok(())));
+        assert!(f.on_dev_buy_unwrapped(id2, uw_op(id2), Ok(())));
         let lz = l(&f, id2);
         assert_eq!((lz.dev_buy_held.0, lz.inflight, lz.step), (near, false, Step::DevBuy));
     }
@@ -5621,12 +5724,12 @@ mod v6_tests {
         assert_eq!(panics(|| drop(f.retry_wnear_owed(U64(id)))), "retry in flight");
 
         ctx(ME, 0);
-        assert!(!f.on_wnear_owed_unwrapped(U64(id), U128(2 * near), U128(3 * near), Err(PromiseError::Failed)));
+        assert!(!f.on_wnear_owed_unwrapped(U64(id), U128(2 * near), U128(3 * near), retry_op(id), Err(PromiseError::Failed)));
         assert_eq!(read_counter(UW_TOTAL_KEY), 5 * near);
         ctx("anyone.near", 0);
         drop(f.retry_wnear_owed(U64(id)));
         ctx(ME, 0);
-        assert!(f.on_wnear_owed_unwrapped(U64(id), U128(2 * near), U128(3 * near), Ok(())));
+        assert!(f.on_wnear_owed_unwrapped(U64(id), U128(2 * near), U128(3 * near), retry_op(id), Ok(())));
         assert_eq!(f.get_wnear_owed(U64(id)), (U128(0), U128(0)));
         assert_eq!(read_counter(UW_TOTAL_KEY), 0);
         assert_eq!(mode_bucket(id), bucket0 + 3 * near, "the bucket's part is back");
@@ -6628,13 +6731,15 @@ mod v6_tests {
             dev_buy_out_key(1), RELAYERS_KEY.to_vec(), swap_lock_key(&a), PENDING_OWNER_KEY.to_vec(),
             FEE_ROUTERS_KEY.to_vec(), LAUNCH_HOOK_KEY.to_vec(), DCLS_KEY.to_vec(), router_near_key(1),
             transfers_key(&a), locker_add_gas_key(&a), dcl_registered_key(&a), unwrap_pending_key(1), locker_add_buy_key(&a), dev_buy_done_key(1), buy_held_key(1), buy_refund_inflight_key(1), no_add_key(1), owed_key("near", &a), owed_total_key("near"), UW_TOTAL_KEY.to_vec(),
+
+            dev_unwrap_op_key(1),
         ];
         let prefixes: Vec<&[u8]> = keys.iter().map(|k| &k[..3]).collect();
         for (i, p) in prefixes.iter().enumerate() {
             assert!(!prefixes[..i].contains(p), "prefix {:?} used twice", String::from_utf8_lossy(p));
             assert!(p[0] >= 0x06 && p[0] != b'S' && p[0] != b'L', "prefix {:?} can meet a map or the state", String::from_utf8_lossy(p));
         }
-        assert_eq!(prefixes.len(), 47);
+        assert_eq!(prefixes.len(), 48);
     }
 
 
@@ -6785,7 +6890,7 @@ mod v6_tests {
         ctx("owner.near", 0);
         assert_eq!(panics(|| drop(f.buyback(U64(id), U128(1)))), "transfer in flight");
 
-        ctx("crank.near", 0);
+        ctx(ME, 0);
         drop(f.collect_tax(U64(id)));
         ctx(ME, 0);
         assert!(f.on_fees_claimed(id, Ok(vec![U128(0), U128(0)])));
@@ -7720,7 +7825,7 @@ mod v6_tests {
         drop(f.on_dev_bought(id, Ok(U128(0))));
         assert!(!l(&f, id).inflight, "a released launch never goes back in flight (claims stay open)");
         ctx(ME, 0);
-        assert!(f.on_dev_buy_unwrapped(id, Ok(())));
+        assert!(f.on_dev_buy_unwrapped(id, uw_op(id), Ok(())));
         assert_eq!(transfers(), vec![("alice.near".to_string(), near)]);
         assert_eq!(l(&f, id).step, Step::Done);
         ctx("alice.near", 0);
@@ -7764,7 +7869,7 @@ mod v6_tests {
         assert!(panics(|| drop(f.sweep_wnear(U128(near)))).contains("retry_wnear_owed"));
 
         ctx(ME, 0);
-        assert!(f.on_dev_buy_unwrapped(id, Ok(())));
+        assert!(f.on_dev_buy_unwrapped(id, uw_op(id), Ok(())));
         assert_eq!(transfers(), vec![("alice.near".to_string(), near)]);
         assert_eq!((read_counter(UW_TOTAL_KEY), f.get_wnear_owed(U64(id)).0 .0), (0, 0));
         ctx("anyone.near", 0);
@@ -7777,6 +7882,187 @@ mod v6_tests {
         env::storage_write(&unwrap_pending_key(id2), &near.to_le_bytes());
         owner();
         assert_eq!(panics(|| f.release_dev_buy(U64(id2))), "resume unwraps the refused buy first");
+    }
+
+
+
+
+
+    fn legion_pending_unwrap(f: &mut Factory, near: u128) -> u64 {
+        let id = dev_buy_launch(f, near);
+        let mut lz = l(f, id);
+        lz.dev_buy_held = U128(0);
+        f.launches.insert(id, lz);
+        ctx(ME, 0);
+        assert!(!f.on_dev_buy_unwrapped(id, uw_op(id), Err(PromiseError::Failed)));
+        assert_eq!(read_counter(UW_TOTAL_KEY), near);
+        ctx("alice.near", 0);
+        drop(f.resume(U64(id)));
+        assert!(l(f, id).inflight && uw_op(id).is_some());
+        id
+    }
+
+    #[test]
+    fn legion_n01_a_release_during_a_retried_unwrap_pays_the_creator_once() {
+        for landed in [true, false] {
+            let mut f = factory();
+            let near = 10u128.pow(24);
+            let id = legion_pending_unwrap(&mut f, near);
+            let op = uw_op(id);
+            owner();
+            f.release_dev_buy(U64(id));
+            assert_eq!(l(&f, id).step, Step::Done);
+
+            assert_eq!(f.get_wnear_owed(U64(id)), (U128(0), U128(0)));
+            ctx("anyone.near", 0);
+            assert_eq!(panics(|| drop(f.retry_wnear_owed(U64(id)))), "nothing owed to this launch");
+            ctx(ME, 0);
+            let r = if landed { Ok(()) } else { Err(PromiseError::Failed) };
+            assert_eq!(f.on_dev_buy_unwrapped(id, op, r), landed);
+            assert!(uw_op(id).is_none() && !env::storage_has_key(&unwrap_pending_key(id)));
+            if landed {
+                assert_eq!(transfers(), vec![("alice.near".to_string(), near)]);
+                assert_eq!((read_counter(UW_TOTAL_KEY), f.get_wnear_owed(U64(id)).0 .0), (0, 0));
+            } else {
+
+                assert!(transfers().is_empty());
+                assert_eq!((read_counter(UW_TOTAL_KEY), f.get_wnear_owed(U64(id)).0 .0), (near, near));
+                ctx("anyone.near", 0);
+                drop(f.retry_wnear_owed(U64(id)));
+                ctx(ME, 0);
+                assert!(f.on_wnear_owed_unwrapped(U64(id), U128(near), U128(0), retry_op(id), Ok(())));
+                assert_eq!(transfers(), vec![("alice.near".to_string(), near)]);
+                assert_eq!((read_counter(UW_TOTAL_KEY), f.get_wnear_owed(U64(id)).0 .0), (0, 0));
+            }
+
+            ctx(ME, 0);
+            assert!(!f.on_dev_buy_unwrapped(id, op, Ok(())));
+            assert!(transfers().is_empty());
+            assert_eq!(logs_with("dev_buy_unwrap_stale").len(), 1);
+        }
+    }
+
+    #[test]
+    fn legion_n01_a_release_during_the_first_unwrap_keeps_a_failed_unwrap_owed() {
+        let mut f = factory();
+        let near = 2 * 10u128.pow(24);
+        let id = dev_buy_launch(&mut f, near);
+        ctx("alice.near", 0);
+        drop(f.resume(U64(id)));
+        ctx(ME, 0);
+        let _ = f.on_dev_bought(id, Ok(U128(0)));
+        let op = uw_op(id);
+        assert!(op.is_some() && l(&f, id).inflight, "the refused swap's unwrap is in flight");
+        owner();
+        f.release_dev_buy(U64(id));
+        assert_eq!(l(&f, id).step, Step::Done);
+        ctx(ME, 0);
+        assert!(!f.on_dev_buy_unwrapped(id, op, Err(PromiseError::Failed)));
+
+        assert_eq!((read_counter(UW_TOTAL_KEY), f.get_wnear_owed(U64(id)).0 .0), (near, near));
+        owner();
+        assert!(panics(|| drop(f.sweep_wnear(U128(1)))).contains("retry_wnear_owed"));
+        ctx("anyone.near", 0);
+        drop(f.retry_wnear_owed(U64(id)));
+        ctx(ME, 0);
+        assert!(f.on_wnear_owed_unwrapped(U64(id), U128(near), U128(0), retry_op(id), Ok(())));
+        assert_eq!(transfers(), vec![("alice.near".to_string(), near)]);
+        assert_eq!((read_counter(UW_TOTAL_KEY), f.get_wnear_owed(U64(id)).0 .0), (0, 0));
+    }
+
+    #[test]
+    fn legion_n01_an_unwrap_whose_callback_died_is_settled_once_by_the_owner() {
+        let mut f = factory();
+        let near = 10u128.pow(24);
+        let id = legion_pending_unwrap(&mut f, near);
+        let op = uw_op(id).unwrap();
+        owner();
+        f.release_dev_buy(U64(id));
+
+        ctx_at("owner.near", 0, op + UNWRAP_RESOLVE_MS - 1);
+        assert_eq!(panics(|| { f.resolve_unwrap(U64(id), true); }), "unwrap in flight: its callback settles it");
+        ctx_at("mallory.near", 0, op + UNWRAP_RESOLVE_MS);
+        assert_eq!(panics(|| { f.resolve_unwrap(U64(id), true); }), "owner only");
+        ctx_at("owner.near", 0, op + UNWRAP_RESOLVE_MS);
+        assert!(f.resolve_unwrap(U64(id), true));
+        assert_eq!(transfers(), vec![("alice.near".to_string(), near)]);
+        assert_eq!((read_counter(UW_TOTAL_KEY), f.get_wnear_owed(U64(id)).0 .0), (0, 0));
+
+        ctx(ME, 0);
+        assert!(!f.on_dev_buy_unwrapped(id, Some(op), Ok(())));
+        assert!(transfers().is_empty());
+        owner();
+        assert_eq!(panics(|| { f.resolve_unwrap(U64(id), true); }), "no unwrap in flight for this launch");
+    }
+
+    #[test]
+    fn legion_n02_a_retry_carries_its_own_callback_gas_and_is_settled_once() {
+        let mut f = factory();
+        let near = 10u128.pow(24);
+        let id = live_burn_launch(&mut f, "OWE2", 10 * near);
+        ctx(ME, 0);
+        assert!(!f.on_dev_refund_unwrapped(id, U128(near), Err(PromiseError::Failed)));
+
+        ctx_gas("anyone.near", 40);
+        assert_eq!(panics(|| drop(f.retry_wnear_owed(U64(id)))), "attach at least 50 TGas");
+        ctx_gas("anyone.near", 50);
+        drop(f.retry_wnear_owed(U64(id)));
+        let cb = near_sdk::test_utils::get_created_receipts().into_iter().flat_map(|r| r.actions).find_map(|a| match a {
+            near_sdk::mock::MockAction::FunctionCallWeight { method_name, prepaid_gas, gas_weight, .. } if method_name == b"on_wnear_owed_unwrapped" => Some((prepaid_gas, gas_weight.0)),
+            _ => None,
+        });
+        assert_eq!(cb, Some((GAS_OWED_CB, 0)), "a fixed budget, not the caller's leftovers");
+        let op = retry_op(id).unwrap();
+
+        ctx_at("anyone.near", 0, op + 24 * 3600 * 1000);
+        assert_eq!(panics(|| drop(f.retry_wnear_owed(U64(id)))), "retry in flight");
+        ctx_at("owner.near", 0, op + UNWRAP_RESOLVE_MS);
+        assert!(!f.resolve_unwrap(U64(id), false));
+        assert_eq!(f.get_wnear_owed(U64(id)), (U128(near), U128(0)), "the unwrap did not land: still owed");
+        ctx(ME, 0);
+        assert!(!f.on_wnear_owed_unwrapped(U64(id), U128(near), U128(0), Some(op), Ok(())), "a late callback moves nothing");
+        assert!(transfers().is_empty());
+        ctx_at("anyone.near", 0, op + UNWRAP_RESOLVE_MS + 1);
+        drop(f.retry_wnear_owed(U64(id)));
+        ctx(ME, 0);
+        assert!(f.on_wnear_owed_unwrapped(U64(id), U128(near), U128(0), retry_op(id), Ok(())));
+        assert_eq!(transfers(), vec![(l(&f, id).creator.to_string(), near)]);
+        assert_eq!((read_counter(UW_TOTAL_KEY), f.get_wnear_owed(U64(id)).0 .0), (0, 0));
+    }
+
+    #[test]
+    fn legion_n09_only_the_keeper_takes_tax() {
+        let mut f = factory();
+        let tid = live_tax_launch(&mut f, "KTAX", None, 10);
+        ctx("anyone.near", 0);
+        assert_eq!(panics(|| drop(f.collect_tax(U64(tid)))), "keeper only");
+        ctx(ME, 0);
+        drop(f.collect_tax(U64(tid)));
+        assert!(calls().iter().any(|c| c.1 == "tax_take"));
+    }
+
+    #[test]
+    fn legion_n03_a_quote_assets_pairs_never_change() {
+        let mut f = factory();
+        let tid = live_tax_launch(&mut f, "QTAX", None, 10);
+        let token = l(&f, tid).token.clone();
+        owner();
+        drop(f.token_add_pair(U64(tid), acct("other-dex.near")));
+        assert!(calls().iter().any(|c| c.0 == token.to_string() && c.1 == "tax_add_pair"));
+        owner();
+        f.set_quote(token.clone(), 24, 0, -100_000, 100_000, 200_000, true);
+        owner();
+        assert_eq!(panics(|| drop(f.token_add_pair(U64(tid), acct("third-dex.near")))), "a quote asset's pairs stay as the lockers read them");
+    }
+
+    #[test]
+    fn legion_n12_the_quote_covers_the_longest_launch() {
+        let mut f = factory();
+        let a = LaunchArgs { name: "\u{1F600}".repeat(32), symbol: "ABCDEFGHIJKL".into(), description: Some("\u{1F600}".repeat(500)), ..args("X") };
+        assert_eq!(a.name.len() + a.symbol.len() + a.description.as_ref().unwrap().len(), MAX_TEXT_BYTES);
+
+        let id = launch_with(&mut f, "alice.near", a);
+        assert_eq!(l(&f, id).symbol, "ABCDEFGHIJKL");
     }
 
     fn first_buy_record(near: u128, used: u128, returned: u128, settled: bool) -> FirstBuyRecord {
@@ -7982,7 +8268,7 @@ mod v6_tests {
         lz.inflight = true;
         f.launches.insert(id, lz);
         ctx(ME, 0);
-        f.on_dev_buy_unwrapped(id, Err(PromiseError::Failed));
+        f.on_dev_buy_unwrapped(id, uw_op(id), Err(PromiseError::Failed));
         assert_eq!(read_counter(UW_TOTAL_KEY), near);
         owner();
         assert!(panics(|| drop(f.sweep_wnear(U128(near)))).contains("resume it first"));
@@ -7990,12 +8276,12 @@ mod v6_tests {
         ctx("alice.near", 0);
         drop(f.resume(U64(id)));
         ctx(ME, 0);
-        f.on_dev_buy_unwrapped(id, Err(PromiseError::Failed));
+        f.on_dev_buy_unwrapped(id, uw_op(id), Err(PromiseError::Failed));
         assert_eq!(read_counter(UW_TOTAL_KEY), near);
         ctx("alice.near", 0);
         drop(f.resume(U64(id)));
         ctx(ME, 0);
-        f.on_dev_buy_unwrapped(id, Ok(()));
+        f.on_dev_buy_unwrapped(id, uw_op(id), Ok(()));
         assert_eq!(read_counter(UW_TOTAL_KEY), 0);
         owner();
         drop(f.sweep_wnear(U128(5)));
@@ -8046,12 +8332,12 @@ mod v6_tests {
         lz.inflight = true;
         f.launches.insert(id2, lz);
         ctx(ME, 0);
-        f.on_dev_buy_unwrapped(id2, Err(PromiseError::Failed));
+        f.on_dev_buy_unwrapped(id2, uw_op(id2), Err(PromiseError::Failed));
         ctx("alice.near", 0);
         drop(f.resume(U64(id2)));
         assert!(calls().iter().any(|c| c.0 == "wrap.near" && c.1 == "near_withdraw"));
         ctx(ME, 0);
-        f.on_dev_buy_unwrapped(id2, Ok(()));
+        f.on_dev_buy_unwrapped(id2, uw_op(id2), Ok(()));
         ctx("alice.near", 0);
         drop(f.cancel_dev_buy(U64(id2)));
         assert_eq!(transfers(), vec![("alice.near".to_string(), near)]);
