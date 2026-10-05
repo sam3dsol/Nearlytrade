@@ -87,3 +87,39 @@ Tests: 141 pass (`cargo test -p nearpad-factory`), new: `a_holders_launch_on_a_p
 Not an audit finding. Owner's decision: the burn pot part is gone and the referral pot takes 10%. `BURN_POT_BPS` = 0 and `REFERRAL_POT_BPS` = 1,000 (the compile time assert still adds the parts to 10,000); `PLATFORM_TAX_BPS` stays 3,000. A launch made from this build on stores 3 legs: the protocol recipients 2/3 and the referral pot 1/3 of the 30% the creator does not take, so 20% and 10% of the whole fee; a tax launch routes its 30% tax cut through the same legs. A burn pot with a 0 part adds no leg. After the deploy the owner called `set_burn_pot(None)`, so `get_burn_pot` is `null`. Launches keep the split written at their creation: 2026-10-02 to 2026-10-03 06:31 UTC 70 / 20 / 5 / 5, before that 80 / 20.
 
 Deployed 2026-10-03 06:30:56 UTC in tx `7y37HWECaHeFmbshWDwES2FpuxBP4aa1Y5nekBVM6gFv`, code `a5bb3313…` (base58 `C9wqAEFG…`, 630,931 bytes), no state migration. Rebuild: `(cd contracts/factory && cargo near build non-reproducible-wasm --locked --no-abi)`. Tests: 141 pass; renamed `every_new_launch_splits_its_fee_70_20_10_and_the_creator_cannot_pick`, `pots_refuse_the_launchpad_and_a_split_that_would_not_fit` now expects 3 legs. Testnet first: launch recipients [protocol 3,333 + 3,334, referral pot 3,333], a claim paid the referral pot exactly 10% of the fees and the burn pot nothing.
+
+## Security review fixes (2026-10-05)
+
+Independent review of 2026-10-04 (commit `56fea17`, findings N-01 to N-12). Fixed in commit `d3c0e52`, deployed 2026-10-05.
+
+| Finding | Severity | Status | Change |
+|---|---|---|---|
+| N-01 | Medium | Fixed | Factory: every dev-buy unwrap carries an operation id (`uf:` marker); only the callback holding the current id settles it, `release_dev_buy` never books an unwrap still in flight, a failed unwrap after Done is booked to `wo:`, and the owner's `resolve_unwrap(launch_id, landed)` is allowed only 30 minutes after the unwrap was sent. One settlement per unwrap. |
+| N-02 | Medium | Fixed | Factory: `retry_wnear_owed` needs 50 TGas attached and gives its callback a fixed 20 TGas (weight 0), so the bookkeeping always runs; the in-flight record (`wi:`) carries the operation id, amount and bucket. |
+| N-03 | Medium | Fixed | Locker: a failed or unreadable `get_tax` of a launch token is not cached; it is read again at the next claim. Factory: `token_add_pair` refuses a token that is an approved quote, so a quote's tax cannot change after a locker read it. |
+| N-04 | Medium | Fixed (new launches) | Token: paid registrations record what they are owed back beyond their storage (`u`); automatic registration only spends balance above storage, margin and that amount. |
+| N-05 | Medium, conditional | Not changed | A whole-system DCL migration is not planned; the oldest lockers are immutable. Disclosed in README. |
+| N-06 | Low | Fixed (new launches) | Token: `ft_resolve_transfer` reports a burned refund as used, not returned. |
+| N-07, N-08, N-10, N-11 | Medium/Low | Disclosed | In immutable earlier token generations only; the current token code does not have them. README, Known limitations. |
+| N-09 | Medium | Mitigated | Factory: `collect_tax` is keeper only. The token-side behaviour stays in the immutable tax v1/v2 tokens. |
+| N-12 | Low | Fixed | Factory: the text storage bound counts the 12-character symbol, so the quote covers the longest valid launch. |
+
+Tests: factory 148, locker 65; token harnesses pass; init and transfer gas unchanged, automatic registration 1.19 to 1.26 TGas.
+
+Builds: factory and locker are now cargo-near reproducible builds (README, Build): factory `6ca88c72…` = `8KA6c2mF…`, locker `cc375a25…` = `EkB8CKVf…`, raw `3c44c33e…` = `54GH1DmZ…`, tax `6bfc00b7…` = `8GXVnFTx…`.
+
+Testnet first, on these exact bytes: the factory put back on the live `a5bb3313…` with existing launches and upgraded to `6ca88c72…` (views unchanged), a new `lock_7` for new launches, old launches still claiming through their locker; dev buy, raw and tax launches, claims, keeper-only `collect_tax`, paid registrations and the longest launch at its exact quote.
+
+Mainnet, 2026-10-05:
+
+| Step | Tx |
+|---|---|
+| Factory code `6ca88c72…` | `5VexucX6RspiP2ZafjHmgSLXTYGtojtxaj8XuHTRoqXq` |
+| Publish raw `3c44c33e…` / tax `6bfc00b7…` | `2QPLWGoQ9JVAqK2BYX28p4MWfogXsoYJgNcNdLk2dqK6` / `EE6puaHuz1iY9JRZH1diHgURxG4P5tJwWh6f8Q9ALuXY` |
+| Factory switches new launches to them | `BfYPUuYa9oVFmc3T5Qf4DLFabofCRwuGmFvdSAUGtEcX` |
+| `lock_7` created (15 NEAR, code `cc375a25…`, no key) | `98RbJXGHxLNJpWtMooebG3zYRhmRo5vhzm2CkQTga38C` |
+| `set_locker_from(lock_7, 2549)` + add gas 111 + add buy | `3beYRK3j59xA9DQ4iNZ6xvKkv7v1M4goKF6TAgBm5Gco` |
+
+Mainnet check after the deploy: test launches #2546 to #2582 (name "test") on the NEAR pair in every option (plain, dev buy, tax with dev buy, burn mode, holders mode, a fee recipient) and on every one of the 30 approved pair assets, plus a tax launch on the $NEARLY pair; a trade filling a tax vault, `collect_tax` refused to anyone but the keeper, a claim through `lock_7`, no wNEAR owed on any launch. All Done.
+
+ADMIN-KEY-01: the factory's full access key stays until the reviewers confirm; owner methods already have function call keys.
