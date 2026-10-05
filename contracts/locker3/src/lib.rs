@@ -870,8 +870,9 @@ impl Locker {
         let (q_ok, t_ok) = (arrived(wq.0), arrived(wt.0));
         let q = self.quote_asset(&quote);
         if probed == Some(true) {
-            let read = env::promise_result_checked(i, 4096).ok()
-                .and_then(|b| near_sdk::serde_json::from_slice::<near_sdk::serde_json::Value>(&b).ok());
+            let raw = env::promise_result_checked(i, 4096);
+            let failed = matches!(raw, Err(PromiseError::Failed));
+            let read = raw.ok().and_then(|b| near_sdk::serde_json::from_slice::<near_sdk::serde_json::Value>(&b).ok());
             match read {
                 Some(v) => {
                     let bps = buy_tax_bps(&v, env::current_account_id().as_str(), self.dcl.as_str(), q.as_str());
@@ -881,9 +882,13 @@ impl Locker {
 
 
 
-                None if self.launchpad_token(&q) => {
+                None if !failed && self.launchpad_token(&q) => {
                     emit("quote_tax_unknown", &format!(r#"{{"quote":"{}"}}"#, q));
                 }
+
+
+
+
 
                 None => {
                     self.quote_tax.insert(self.tax_key(&q), 0);
@@ -2332,11 +2337,31 @@ mod claim_tests {
         assert_eq!(buy_tax_bps(&near_sdk::serde_json::json!({"tax": {"buy_bps": "150", "pairs": [DCL], "admin": "a"}}), me, DCL, "t.near"), 150, "a string bps, no exempt list");
     }
 
-    /// NEAR Legion review (10-04): a failed or unreadable tax view of a token of this launchpad is not
-    /// cached as no tax; nothing of that quote is withdrawn, and the next claim reads it again.
+    /// lock_8: a FAILED tax view (no `get_tax`: a plain launchpad token such as $NEARLY) is no tax, so the
+    /// quote is withdrawn and forwarded from the next claim on, like any other FT.
     #[test]
-    fn a_failed_tax_read_of_a_launchpad_token_is_read_again() {
-        for (q, result) in [(ninu(), PromiseResult::Failed), ("diarhea.nearlytrade.near".parse::<AccountId>().unwrap(), ok(b"not json"))] {
+    fn a_failed_tax_read_of_a_launchpad_token_is_no_tax() {
+        let q: AccountId = "nearly-993927.nearlytrade.near".parse().unwrap();
+        cb(vec![]);
+        let mut l = Locker::new("nearlytrade.near".parse().unwrap(), DCL.parse().unwrap(), wrap());
+        cb(vec![]);
+        drop(claimed(&mut l, cat(), true, Some(q.clone()), vec![U128(0), U128(10_000)]));
+        assert_eq!(names(), vec!["get_tax", "on_withdrawn"], "first claim reads the tax instead of withdrawing");
+        cb(vec![PromiseResult::Failed]);
+        drop(l.on_withdrawn(cat(), true, Some(q.clone()), U128(0), U128(0), Some(true)));
+        assert_eq!(l.get_quote_tax(q.clone()), Some(0), "a failed read is no tax, cached");
+        assert_eq!(l.get_dcl_reserved(q.clone()).0, 10_000, "still at the exchange until the next claim");
+
+        cb(vec![]);
+        drop(claimed(&mut l, cat(), true, Some(q.clone()), vec![U128(0), U128(0)]));
+        assert_eq!(names(), vec!["withdraw_asset", "on_withdrawn"]);
+    }
+
+    /// NEAR Legion review (10-04): an unreadable ANSWER from a token of this launchpad is not cached as
+    /// no tax; nothing of that quote is withdrawn, and the next claim reads it again.
+    #[test]
+    fn an_unreadable_tax_read_of_a_launchpad_token_is_read_again() {
+        for (q, result) in [(ninu(), ok(b"not json")), ("diarhea.nearlytrade.near".parse::<AccountId>().unwrap(), ok(b"not json"))] {
             cb(vec![]);
             let mut l = Locker::new("nearlytrade.near".parse().unwrap(), DCL.parse().unwrap(), wrap());
             cb(vec![]);
