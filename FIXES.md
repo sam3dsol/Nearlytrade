@@ -123,3 +123,24 @@ Mainnet, 2026-10-05:
 Mainnet check after the deploy: test launches #2546 to #2582 (name "test") on the NEAR pair in every option (plain, dev buy, tax with dev buy, burn mode, holders mode, a fee recipient) and on every one of the 30 approved pair assets, plus a tax launch on the $NEARLY pair; a trade filling a tax vault, `collect_tax` refused to anyone but the keeper, a claim through `lock_7`, no wNEAR owed on any launch. All Done.
 
 ADMIN-KEY-01: the factory's full access key stays until the reviewers confirm; owner methods already have function call keys.
+
+## Follow-up (2026-10-06): plain pair tokens forward their quote fees (lock_8)
+
+The N-03 fix made a locker read a pair token's `get_tax` before it withdraws that side of the fees, and it treated any failed or unreadable read of a launchpad token as unknown: nothing withdrawn, read again on the next claim. A plain launchpad token has no `get_tax`, so the read fails on every claim. On `lock_7` the quote side of every launch paired with $NEARLY (raw v1, no `get_tax`) stays at the exchange: it is held in `lock_7`'s DCL balance, booked per launch (`get_owed_quote`), never lost, and `lock_7` has no key and no way to change that.
+
+Every token template this launchpad deployed exports `get_tax` if and only if it carries a tax: checked on mainnet for all 2,593 launches to that date (the six tax generations export it, the four raw ones do not; the one exception, #90, failed with no code and can never be a pair). So in `lock_8` a FAILED view means no tax, for any token, and it is cached as 0. An unreadable answer from a launchpad token is still unknown and read again (N-03 kept for that case).
+
+Tests: locker 66 (a failed read is no tax and the quote is withdrawn on the next claim; an unreadable answer is read again).
+
+Build: locker `2f7bd173…` = `4CMfhWsU…` (commit `a476bbe`, README, Build).
+
+Testnet first, on these exact bytes: a plain token launched on the testnet factory and approved as a pair asset, a launch on that pair on `lock_8`, trades both ways, claim 1 caches no tax, claim 2 books the quote fees to the creator and the protocol and leaves nothing owed or held.
+
+Mainnet, 2026-10-06:
+
+| Step | Tx |
+|---|---|
+| `lock_8` created (15 NEAR, code `2f7bd173…`, no key), registered on the DCL, wNEAR and all 30 approved pair assets | `GkwA3qx6R6Nm7ZGAjQdAwuWSYbRudKUU4EFXyedwaGMP` |
+| `set_locker_from(lock_8, 2596)` + add gas 111 + add buy | `9xB7CoQLXGgJyHtqxeBQJMTZ2YR48Y94P2V9FmZgxmmm` |
+
+Launches #2549 to #2595 stay on `lock_7` with the behaviour above.

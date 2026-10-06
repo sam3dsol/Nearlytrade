@@ -2,7 +2,7 @@
 
 Source for the contracts behind [nearly.trade](https://nearly.trade), a token launchpad on NEAR mainnet. Every launch creates a token with a fixed 1,000,000,000 supply and places it as a single-sided position on Rhea's DCL (`dclv2.ref-labs.near`). A locker contract owns that position; it has no way to remove the liquidity, it can only claim fees.
 
-- `contracts/` is the code live on mainnet: the factory (`nearlytrade.near`), the locker that holds every new launch (`lock_7.nearlytrade.near`), and the raw and tax tokens new launches run.
+- `contracts/` is the code live on mainnet: the factory (`nearlytrade.near`), the locker that holds every new launch (`lock_8.nearlytrade.near`), and the raw and tax tokens new launches run.
 - `legacy/` is every earlier locker and token generation. They are frozen (no access keys, immutable global code) and still hold or run the launches made with them, $NEARLY (`nearly-993927.nearlytrade.near`, raw v1) among them.
 - `SPEC.md` describes the deployed code, `FIXES.md` lists the audit and review fixes and every upgrade since.
 
@@ -15,7 +15,7 @@ Deployed contracts (current since 2026-10-05 19:31 UTC, security review fixes, s
 | Contract | Path | On chain | Code hash (hex) | Base58 |
 |---|---|---|---|---|
 | Factory | `contracts/factory` | `nearlytrade.near`, upgraded in place in tx `5VexucX6RspiP2ZafjHmgSLXTYGtojtxaj8XuHTRoqXq` (2026-10-05, security review fixes, see `FIXES.md`) after `7y37HWEC…` (2026-10-03 06:31 UTC, `a5bb3313…` = `C9wqAEFG…`, new launches split 70 creator / 20 protocol / 10 referral pot, no burn pot part), `Ejp7RVPL…` (2026-10-02 19:02 UTC, holders mode on every pair, buyback excess no longer booked, pot checks, tickers up to 12 characters), `H1XNfark…` (`tax_return`), `2ouURYue…` (fee split fixed at 70 creator / 20 protocol / 5 burn pot / 5 referral pot for new launches), `7Zj5R8TA…` (icon on the token only) and `E6gkiYsQ…` (2026-10-01, ContractWolf audit fixes = `c427d8f6…`, see `FIXES.md`); no state migration, new state lives in raw storage keys | `6ca88c72f4a0ff1e178d927bb22c92e13bfda12ff20a7a99b456b446c2ea642d` (640,333 bytes) | `8KA6c2mFcHYsqroXMz1yjhAeb1LpDZw2pSxKxyoeYb5N` |
-| Locker v3 | `contracts/locker3` | `lock_7.nearlytrade.near` (created 2026-10-05 in tx `98RbJXGHxLNJpWtMooebG3zYRhmRo5vhzm2CkQTga38C`, 0 keys, launches #2549 onward; #2192 to #2548 sit in `lock_6` = `0097d9a9…` / `13KJEWasGi6jrk3X99FDqeCbZ3Uqdpbbkd27fzSkx4Ut`, 0 keys, the source of commit `56fea17`; #2064 to #2191 in `lock_5` = `1c84bfec…` / `2vKpZcuEkab2hdXomeTN2fj67CdHWXpbDeBZmKJZZpSX`, the same source before the `supply_reserved` fix; #1810 to #2063 in `lock3`/`lock4`/`lock_4`, see `legacy/`) | `cc375a25b0076172bff0b5284ed9a513ec5b96c0665a1c57f3d25f9813b2196e` (287,514 bytes) | `EkB8CKVfvBfKTFcMjGk9iKTEzjxiUTVqHUBH1HjxTQLd` |
+| Locker v3 | `contracts/locker3` | `lock_8.nearlytrade.near` (created 2026-10-06 in tx `GkwA3qx6R6Nm7ZGAjQdAwuWSYbRudKUU4EFXyedwaGMP`, 0 keys, launches #2596 onward, see `FIXES.md`; #2549 to #2595 sit in `lock_7` = `cc375a25…` / `EkB8CKVfvBfKTFcMjGk9iKTEzjxiUTVqHUBH1HjxTQLd`, 0 keys, built from commit `d3c0e52`; #2192 to #2548 sit in `lock_6` = `0097d9a9…` / `13KJEWasGi6jrk3X99FDqeCbZ3Uqdpbbkd27fzSkx4Ut`, 0 keys, the source of commit `56fea17`; #2064 to #2191 in `lock_5` = `1c84bfec…` / `2vKpZcuEkab2hdXomeTN2fj67CdHWXpbDeBZmKJZZpSX`, the same source before the `supply_reserved` fix; #1810 to #2063 in `lock3`/`lock4`/`lock_4`, see `legacy/`) | `2f7bd173e4aef59e944d36ae0152d22d7d6a08c3dbac5a9a166eb954db898312` (287,404 bytes) | `4CMfhWsUNfXgotni5nnt9vePC1dpb4aQF8x1KQjoyG6u` |
 | Token (tax) | `contracts/token-tax` | global contract (v6), the factory's tax code hash since tx `BfYPUuYa9oVFmc3T5Qf4DLFabofCRwuGmFvdSAUGtEcX` (published in `EE6puaHuz1iY9JRZH1diHgURxG4P5tJwWh6f8Q9ALuXY`, 2026-10-05); tax launches created after it run it. Earlier ones keep the code they were created with: v5 `f4265f22…` = `HS4R2isPS7hnnY8k2QbxnLHUx9Z9v9mNZnLsrGqwhChh` (2026-10-01 to #2545, source of commit `56fea17`), v4 `3b01653b…` = `4yLHirATwQvHfn99Vsb98mWMkvVZhjgeJ5ahx4WhC1MZ` (#2061 to the switch), `aca1a7f8…` from #1901, the frozen tax v2 before | `6bfc00b72948064a5c18c8081a1107a7f9e2b3f2068b5060d2f3711ec195a482` (22,258 bytes) | `8GXVnFTxx1d6tYnoqNiQ5YzzQpj1uyxG7u28LeCGmsER` |
 | Token (raw) | `contracts/token-raw` | global contract, the factory's raw code hash since the same tx (published in `2QPLWGoQ9JVAqK2BYX28p4MWfogXsoYJgNcNdLk2dqK6`); earlier launches keep `b611c33f…` = `DFiuocosGQbx3raMt3ACEauZqLXXYzX77MJNf361385R` (2026-10-01 to #2545, source of commit `56fea17`) or `95ec4ec3…` | `3c44c33eed3f606d15588c8e09080a0bee8f264b8ded30347171b8306d0f8df9` (16,743 bytes) | `54GH1DmZgArERRH2ed8zJBXT7UxdeumaZe8Du8dtYJrt` |
 
@@ -36,7 +36,7 @@ Earlier generations, frozen (they stay live next to the new code). Each folder h
 | Token (tax) v2 | `legacy/token-tax-v2` | 714 | global, tax launches 2026-09-28 to #1900 | `YXJL2KYynDA52JPBpAP5qDZhJqCTfB6dR5Ee4jdEgDK` = `08134395…` | match |
 | Token (tax) v3 | `legacy/token-tax-v3` | 740 | global, tax launches #1901 to #2060 | `Cct6RbLZAEs5WmKkPFr4qqTAWKKzPhE4aTJHVwNLeGBS` = `aca1a7f8…` | match (2026-10-01) |
 
-The factory keeps a per-launch locker schedule, so every locker stays in use for its own launches: `get_lockers` returns lock from 0, lock2 from 158, lock3 from 1810, lock4 from 1931, lock_4 from 1935, lock_5 from 2064, lock_6 from 2192 and lock_7 from 2549. Tokens are published once as NEAR global contracts (by code hash) and every launch deploys its token account against one of those hashes. The earlier token generations stay live for older launches (table above).
+The factory keeps a per-launch locker schedule, so every locker stays in use for its own launches: `get_lockers` returns lock from 0, lock2 from 158, lock3 from 1810, lock4 from 1931, lock_4 from 1935, lock_5 from 2064, lock_6 from 2192, lock_7 from 2549 and lock_8 from 2596. Tokens are published once as NEAR global contracts (by code hash) and every launch deploys its token account against one of those hashes. The earlier token generations stay live for older launches (table above).
 
 ## Verify the deployed code
 
@@ -47,11 +47,11 @@ RPC=https://rpc.mainnet.fastnear.com
 q() { curl -s $RPC -H 'content-type: application/json' -d "$1"; }
 
 # accounts: code hash and access keys
-for a in nearlytrade.near lock_7.nearlytrade.near lock_6.nearlytrade.near lock_5.nearlytrade.near lock.nearlytrade.near lock2.nearlytrade.near lock3.nearlytrade.near lock4.nearlytrade.near lock_4.nearlytrade.near; do
+for a in nearlytrade.near lock_8.nearlytrade.near lock_7.nearlytrade.near lock_6.nearlytrade.near lock_5.nearlytrade.near lock.nearlytrade.near lock2.nearlytrade.near lock3.nearlytrade.near lock4.nearlytrade.near lock_4.nearlytrade.near; do
   q '{"jsonrpc":"2.0","id":1,"method":"query","params":{"request_type":"view_account","finality":"final","account_id":"'$a'"}}' | jq -r '.result.code_hash'
   q '{"jsonrpc":"2.0","id":1,"method":"query","params":{"request_type":"view_access_key_list","finality":"final","account_id":"'$a'"}}' | jq '.result.keys|length'
 done
-# expected: nearlytrade.near 8KA6c2mF…, lock_7.nearlytrade.near EkB8CKVf… 0 keys, lock_6.nearlytrade.near 13KJEWas… 0 keys, lock_5.nearlytrade.near 2vKpZcuE… 0 keys, lock.nearlytrade.near J7eJu1Wr… 0 keys, lock2.nearlytrade.near H2hLLyZ9… 0 keys, lock3 8buG64Gs… 0 keys, lock4 9uhDnu5x… 0 keys, lock_4 BAXUNRds… 0 keys
+# expected: nearlytrade.near 8KA6c2mF…, lock_8.nearlytrade.near 4CMfhWsU… 0 keys, lock_7.nearlytrade.near EkB8CKVf… 0 keys, lock_6.nearlytrade.near 13KJEWas… 0 keys, lock_5.nearlytrade.near 2vKpZcuE… 0 keys, lock.nearlytrade.near J7eJu1Wr… 0 keys, lock2.nearlytrade.near H2hLLyZ9… 0 keys, lock3 8buG64Gs… 0 keys, lock4 9uhDnu5x… 0 keys, lock_4 BAXUNRds… 0 keys
 
 # global contracts: fetch the code by hash and sha256 it
 for h in 54GH1DmZgArERRH2ed8zJBXT7UxdeumaZe8Du8dtYJrt 8GXVnFTxx1d6tYnoqNiQ5YzzQpj1uyxG7u28LeCGmsER DFiuocosGQbx3raMt3ACEauZqLXXYzX77MJNf361385R HS4R2isPS7hnnY8k2QbxnLHUx9Z9v9mNZnLsrGqwhChh 4yLHirATwQvHfn99Vsb98mWMkvVZhjgeJ5ahx4WhC1MZ 5qScjXG9uRG82Yrh36XZNZgVUYiqPtuC9ep5DvV42eGQ B6EjqsNJXfQXYX1KkUaypN8z7KpYcBrf9JNwTVtWUUBY 1uGuBEpx3dFRDrr2wNzm5Vcb5sF3jWY3AKQ3Gopd6we YXJL2KYynDA52JPBpAP5qDZhJqCTfB6dR5Ee4jdEgDK Cct6RbLZAEs5WmKkPFr4qqTAWKKzPhE4aTJHVwNLeGBS; do
@@ -63,16 +63,16 @@ for c in locker-v1 locker-v2 locker3-lock3 locker3-lock4 locker3-lock_4 token-ra
 
 ```
 
-The NEP-330 metadata of the factory and the lockers (`contract_source_metadata`) points at the public repo `sam3dsol/Nearlytrade`; the factory and `lock_7` pin commit `d3c0e525c15d3239794d8eafda76775833e771b0`; lock v1's pinned commit no longer exists there after a history rewrite, which is why the rebuild recipe pins the same values by hand.
+The NEP-330 metadata of the factory and the lockers (`contract_source_metadata`) points at the public repo `sam3dsol/Nearlytrade`; the factory and `lock_7` pin commit `d3c0e525c15d3239794d8eafda76775833e771b0`, `lock_8` pins `a476bbe47a694e2b24e7060738870065882df011`; lock v1's pinned commit no longer exists there after a history rewrite, which is why the rebuild recipe pins the same values by hand.
 
 ## Build
 
 Toolchain: Rust 1.97.1 (`rust-toolchain.toml`), cargo-near 0.22.0, binaryen `wasm-opt` 132.
 
 ```sh
-# factory + locker: reproducible, in the Docker image pinned in each Cargo.toml (needs docker; check out commit d3c0e52)
-(cd contracts/factory && cargo near build reproducible-wasm)   # -> 6ca88c72…
-(cd contracts/locker3 && cargo near build reproducible-wasm)   # -> cc375a25…
+# factory + locker: reproducible, in the Docker image pinned in each Cargo.toml (needs docker)
+(cd contracts/factory && cargo near build reproducible-wasm)   # -> 6ca88c72… (factory unchanged since commit d3c0e52)
+(cd contracts/locker3 && cargo near build reproducible-wasm)   # -> 2f7bd173… = lock_8 (commit a476bbe); at commit d3c0e52 -> cc375a25… = lock_7
 
 # tokens (no paths or metadata in these builds, the same bytes on macOS arm64 and Linux x86_64)
 
