@@ -144,3 +144,31 @@ Mainnet, 2026-10-06:
 | `set_locker_from(lock_8, 2596)` + add gas 111 + add buy | `9xB7CoQLXGgJyHtqxeBQJMTZ2YR48Y94P2V9FmZgxmmm` |
 
 Launches #2549 to #2595 stay on `lock_7` with the behaviour above.
+
+## Follow-up (2026-10-07): the owner DAO upgrades the factory
+
+Since 2026-10-06 the factory owner is the Sputnik DAO `nearlytrade.sputnik-dao.near` (4 signers, 3 of 4 approvals; it has no access keys). Every owner method runs only through a passed proposal. Until now an upgrade went through `upgrade(code_hash)`, which needs the code published as a global contract first (about 64 NEAR for the factory).
+
+New owner method `upgrade_code()`: its raw call input is the wasm itself (not JSON). It refuses anything that does not start with the wasm magic bytes, logs an `upgrade` event with the sha256 of the code, then deploys it to the factory and calls the new code's `migrate` in the same receipt, so code without a callable `migrate` reverts and the factory keeps its code. This is the call Sputnik's `UpgradeRemote` proposal makes:
+
+1. anyone stores the wasm in the DAO with `store_blob` (deposit = storage of the code); the DAO returns its sha256, which is the reproducible build hash
+2. a proposal `UpgradeRemote { receiver_id: nearlytrade.near, method_name: upgrade_code, hash }` passes with 3 of 4 approvals and calls `upgrade_code` with the stored code
+3. the storer takes the deposit back with `remove_blob`
+
+The DAO marks a proposal Approved even if the call it makes fails, so after an upgrade check the factory's code hash on chain. The executing approval needs about 120 TGas (attach 300). `upgrade(code_hash)` stays.
+
+Tests: factory 149 (`upgrade_code`: owner only, the factory's own keys are not the owner, empty and JSON input refused, one receipt = deploy + `migrate`, the event carries the sha256).
+
+Build: factory `aba3be30…` = `CZ1XpbUk…` (commit `38abcd8`, README, Build).
+
+Testnet first, on these exact bytes, a factory owned by a Sputnik DAO: direct deploy of this build, `upgrade_code` called directly by the factory's full key or by an outsider refused, JSON input from the DAO refused, DAO upgrades to the same bytes, to other code and back, and to the previous factory build; code without `migrate` refused with the code unchanged; one approval short leaves every proposal in progress; every deposit refunded.
+
+Mainnet, 2026-10-07:
+
+| Step | Tx |
+|---|---|
+| Factory code `aba3be30…` deployed, views unchanged | `D1vNiZErqh7tXBCpcjzhKRst2U9afGuSToXmEYBgW8Cc` |
+| `store_blob` of the same bytes in the DAO (returns `CZ1XpbUk…`) | `GyMo6SgCeRTADYhjoNdMiCc3YdhBiQJ8Y83xbGqQ46hT` |
+| Proposal #5 `UpgradeRemote` to `upgrade_code`, approvals 1 and 2 leave it in progress | `ASWVnKT76rCn9Y1Z3KvtoVJVYuHQe5f9f1fsdWMPeABV`, `BVvuN53dhykhjgK3sbYKmuims8FzrSkCzhfR6pyRyNy3`, `FN1tNRk3Noju2vgU9oErXuiMRNfEtqjaKaZ362AwgopN` |
+| Approval 3 executes: `upgrade` event `aba3be30…` raw, code `CZ1XpbUk…`, views unchanged | `GLbDAGenjZ7h65hdhqYM5hUwZncQQi5VwEYGAAZzFvHP` |
+| `remove_blob`, deposit refunded | `9HfiUsDBPxuDCeRkiG3c7QYJzidtFMbPzvq33XcDpyky` |
