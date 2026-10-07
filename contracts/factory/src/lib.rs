@@ -223,6 +223,14 @@ const GAS_TAX_TAKE: Gas = Gas::from_tgas(10);
 
 const GAS_MIGRATE: Gas = Gas::from_tgas(20);
 
+const GAS_LOCKER_NEW: Gas = Gas::from_tgas(30);
+const GAS_ON_LOCKER_CREATED: Gas = Gas::from_tgas(10);
+
+
+const LOCKER_MIN_FREE: u128 = 1_000_000_000_000_000_000_000_000;
+
+const LOCKER_ACCOUNT_BYTES: u128 = 1_000;
+
 const GAS_GET_POSITION: Gas = Gas::from_tgas(10);
 const GAS_ON_STUCK_POSITION: Gas = Gas::from_tgas(15);
 const _: () = assert!(tg(GAS_ON_SPLIT) + 5 <= tg(GAS_ON_STUCK_POSITION), "on_stuck_position must fit the refund and its callback");
@@ -2987,6 +2995,94 @@ impl Factory {
 
 
 
+    #[payable]
+    pub fn fund_locker_reserve(&mut self) -> U128 {
+        let d = env::attached_deposit().as_yoctonear();
+        require!(d > 0, "locker reserve: attach the NEAR to add");
+        add_counter(LOCKER_RESERVE_KEY, d);
+        let r = read_counter(LOCKER_RESERVE_KEY);
+        emit("locker_reserve_funded", &format!(r#"{{"by":"{}","amount":"{}","reserve":"{}"}}"#, env::predecessor_account_id(), d, r));
+        U128(r)
+    }
+
+
+
+
+
+
+
+
+
+    pub fn create_locker(&mut self) -> Promise {
+        self.assert_owner();
+        let code = env::input().unwrap_or_default();
+        require!(code.starts_with(b"\0asm"), "create_locker: the input must be the wasm itself");
+        let reserve = read_counter(LOCKER_RESERVE_KEY);
+        let need = (code.len() as u128 + LOCKER_ACCOUNT_BYTES) * STORAGE_PRICE_PER_BYTE + LOCKER_MIN_FREE;
+        require!(reserve >= need, format!("locker reserve: {} yocto, this code needs at least {}", reserve, need));
+        let n = self.next_locker_n();
+        env::storage_write(LOCKER_N_KEY, &n.to_le_bytes());
+        env::storage_remove(LOCKER_RESERVE_KEY);
+        let me = env::current_account_id();
+        let locker: AccountId = format!("lock_{}.{}", n, me).parse().expect("locker id");
+        let dcl = self.dcl_for(self.next_id);
+        emit("locker_create", &format!(
+            r#"{{"locker":"{}","amount":"{}","code_hash":"{}","dcl":"{}"}}"#,
+            locker, reserve, hex32(env::sha256_array(&code)), dcl
+        ));
+        let args = format!(r#"{{"factory":"{}","dcl":"{}","wnear":"{}"}}"#, me, dcl, self.wnear_id);
+        Promise::new(locker.clone())
+            .create_account()
+            .transfer(NearToken::from_yoctonear(reserve))
+            .deploy_contract(code)
+            .function_call("new".to_string(), args.into_bytes(), NO_DEPOSIT, GAS_LOCKER_NEW)
+            .then(Self::ext(me).with_static_gas(GAS_ON_LOCKER_CREATED).with_unused_gas_weight(0).on_locker_created(locker, U128(reserve)))
+    }
+
+
+    #[private]
+    pub fn on_locker_created(&mut self, locker: AccountId, amount: U128, #[callback_result] r: Result<(), PromiseError>) -> bool {
+        if r.is_ok() {
+            emit("locker_created", &format!(r#"{{"locker":"{}","amount":"{}"}}"#, locker, amount.0));
+            return true;
+        }
+        add_counter(LOCKER_RESERVE_KEY, amount.0);
+        emit("locker_create_failed", &format!(r#"{{"locker":"{}","amount":"{}","reserve":"{}"}}"#, locker, amount.0, read_counter(LOCKER_RESERVE_KEY)));
+        false
+    }
+
+
+
+    pub fn withdraw_locker_reserve(&mut self, to: AccountId, amount: Option<U128>) -> Promise {
+        self.assert_owner();
+        let r = read_counter(LOCKER_RESERVE_KEY);
+        let amount = amount.map(|a| a.0).unwrap_or(r);
+        require!(amount > 0 && amount <= r, "amount exceeds the locker reserve");
+        sub_counter(LOCKER_RESERVE_KEY, amount);
+        emit("locker_reserve_withdrawn", &format!(r#"{{"to":"{}","amount":"{}"}}"#, to, amount));
+        Promise::new(to.clone())
+            .transfer(NearToken::from_yoctonear(amount))
+            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_ON_SPLIT).with_unused_gas_weight(0).on_locker_reserve_sent(to, U128(amount)))
+    }
+
+    #[private]
+    pub fn on_locker_reserve_sent(&mut self, to: AccountId, amount: U128, #[callback_result] r: Result<(), PromiseError>) -> bool {
+        if r.is_ok() { return true; }
+        add_counter(LOCKER_RESERVE_KEY, amount.0);
+        emit("locker_reserve_returned", &format!(r#"{{"to":"{}","amount":"{}"}}"#, to, amount.0));
+        false
+    }
+
+    pub fn get_locker_reserve(&self) -> U128 { U128(read_counter(LOCKER_RESERVE_KEY)) }
+
+
+    pub fn get_next_locker(&self) -> AccountId {
+        format!("lock_{}.{}", self.next_locker_n(), env::current_account_id()).parse().expect("locker id")
+    }
+
+
+
+
 
 
     pub fn add_fc_key(&mut self, public_key: PublicKey, methods: Vec<String>, allowance: Option<U128>) -> Promise {
@@ -3208,6 +3304,17 @@ impl Factory {
 impl Factory {
     fn is_house(&self, a: &AccountId) -> bool {
         self.house_creator.as_ref() == Some(a) || env::storage_has_key(&house_key(a))
+    }
+
+
+    fn next_locker_n(&self) -> u64 {
+        let suffix = format!(".{}", env::current_account_id());
+        let made = env::storage_read(LOCKER_N_KEY).map(|b| u64::from_le_bytes(b.try_into().expect("locker n"))).unwrap_or(0);
+        self.get_lockers()
+            .iter()
+            .filter_map(|(_, a)| a.as_str().strip_suffix(&suffix)?.strip_prefix("lock_")?.parse::<u64>().ok())
+            .fold(made, u64::max)
+            + 1
     }
 
 
@@ -4668,6 +4775,9 @@ const LOCKERS_KEY: &[u8] = b"lks";
 fn lockers() -> Vec<(u64, AccountId)> {
     env::storage_read(LOCKERS_KEY).map(|b| near_sdk::serde_json::from_slice(&b).expect("lockers")).unwrap_or_default()
 }
+
+const LOCKER_RESERVE_KEY: &[u8] = b"lkr";
+const LOCKER_N_KEY: &[u8] = b"lkn";
 fn tax_code_hash() -> Option<CryptoHash> { env::storage_read(TAX_CODE_KEY).map(|b| b.try_into().expect("tax code hash")) }
 fn tax_opts_key(id: u64) -> Vec<u8> { [b"tx:".as_slice(), &id.to_le_bytes()].concat() }
 fn tax_pending_key(id: u64) -> Vec<u8> { [b"tt:".as_slice(), &id.to_le_bytes()].concat() }
@@ -6571,6 +6681,119 @@ mod v6_tests {
         assert!(matches!(&r[0].actions[1], MockAction::FunctionCallWeight { method_name, attached_deposit, .. } if method_name == b"migrate" && attached_deposit.as_yoctonear() == 0));
         assert!(logs_with("upgrade")[0].contains(&hex32(env::sha256_array(&code))));
         assert!(logs_with("upgrade")[0].contains(r#""raw":true"#));
+    }
+
+    const ONE_NEAR: u128 = 1_000_000_000_000_000_000_000_000;
+
+    fn locker_code() -> Vec<u8> { [b"\0asm\x01\0\0\0".as_slice(), &vec![7u8; 287_506]].concat() }
+    fn reserve() -> u128 { read_counter(LOCKER_RESERVE_KEY) }
+
+    #[test]
+    fn locker_reserve_is_funded_by_anyone_and_withdrawn_by_the_owner_only() {
+        let mut f = factory();
+        ctx("anyone.near", 0);
+        assert_eq!(panics(|| { f.fund_locker_reserve(); }), "locker reserve: attach the NEAR to add");
+        ctx("nearlyops.near", 4 * ONE_NEAR);
+        assert_eq!(f.fund_locker_reserve().0, 4 * ONE_NEAR);
+        ctx("anyone.near", 2 * ONE_NEAR);
+        assert_eq!(f.fund_locker_reserve().0, 6 * ONE_NEAR);
+        assert!(logs_with("locker_reserve_funded")[0].contains(r#""by":"anyone.near""#));
+        assert_eq!(f.get_locker_reserve().0, 6 * ONE_NEAR);
+        for who in ["mallory.near", ME] {
+            ctx(who, 0);
+            assert_eq!(panics(|| drop(f.withdraw_locker_reserve(acct("x.near"), None))), "owner only");
+        }
+        ctx("owner.near", 0);
+        assert_eq!(panics(|| drop(f.withdraw_locker_reserve(acct("x.near"), Some(U128(7 * ONE_NEAR))))), "amount exceeds the locker reserve");
+        drop(f.withdraw_locker_reserve(acct("ops.near"), Some(U128(ONE_NEAR))));
+        assert_eq!(reserve(), 5 * ONE_NEAR);
+        let r = get_created_receipts();
+        assert_eq!(r[0].receiver_id, acct("ops.near"));
+        assert!(matches!(&r[0].actions[..], [MockAction::Transfer { deposit, .. }] if deposit.as_yoctonear() == ONE_NEAR));
+
+        ctx_results(vec![near_sdk::PromiseResult::Failed]);
+        assert!(!f.on_locker_reserve_sent(acct("ops.near"), U128(ONE_NEAR), Err(PromiseError::Failed)));
+        assert_eq!(reserve(), 6 * ONE_NEAR);
+        ctx("owner.near", 0);
+        drop(f.withdraw_locker_reserve(acct("ops.near"), None));
+        assert_eq!(reserve(), 0);
+        ctx_results(vec![near_sdk::PromiseResult::Successful(vec![])]);
+        assert!(f.on_locker_reserve_sent(acct("ops.near"), U128(6 * ONE_NEAR), Ok(())));
+        assert_eq!(reserve(), 0);
+    }
+
+    #[test]
+    fn create_locker_makes_the_next_lock_n_from_the_raw_input_with_the_whole_reserve() {
+        let mut f = factory();
+        let code = locker_code();
+        let need = (code.len() as u128 + LOCKER_ACCOUNT_BYTES) * STORAGE_PRICE_PER_BYTE + LOCKER_MIN_FREE;
+
+        ctx("owner.near", 0);
+        for (n, from) in [("lock_4", 10u64), ("lock_8", 20), ("lock_x", 30)] {
+            f.next_id = from;
+            f.set_locker_from(acct(&format!("{}.{}", n, ME)), U64(from));
+        }
+        assert_eq!(f.get_next_locker(), acct(&format!("lock_9.{}", ME)));
+        ctx("nearlyops.near", need - 1);
+        f.fund_locker_reserve();
+        for who in ["mallory.near", ME] {
+            ctx_input(who, &code);
+            assert_eq!(panics(|| drop(f.create_locker())), "owner only");
+        }
+        ctx_input("owner.near", b"");
+        assert_eq!(panics(|| drop(f.create_locker())), "create_locker: the input must be the wasm itself");
+        ctx_input("owner.near", br#"{"code":"AGFzbQ=="}"#);
+        assert_eq!(panics(|| drop(f.create_locker())), "create_locker: the input must be the wasm itself");
+        ctx_input("owner.near", &code);
+        assert_eq!(panics(|| drop(f.create_locker())), format!("locker reserve: {} yocto, this code needs at least {}", need - 1, need));
+        ctx("nearlyops.near", 2 * ONE_NEAR + 1);
+        f.fund_locker_reserve();
+        let all = need + 2 * ONE_NEAR;
+        ctx_input("owner.near", &code);
+        drop(f.create_locker());
+        assert_eq!(reserve(), 0, "the whole reserve goes to the locker");
+        let r = get_created_receipts();
+        let lk = acct(&format!("lock_9.{}", ME));
+        assert_eq!(r[0].receiver_id, lk);
+        match &r[0].actions[..] {
+            [MockAction::CreateAccount { .. }, MockAction::Transfer { deposit, .. }, MockAction::DeployContract { code: c, .. }, MockAction::FunctionCallWeight { method_name, args, attached_deposit, prepaid_gas, .. }] => {
+                assert_eq!(deposit.as_yoctonear(), all);
+                assert!(*c == code);
+                assert_eq!(method_name, b"new");
+                assert_eq!(String::from_utf8(args.clone()).unwrap(), format!(r#"{{"factory":"{}","dcl":"dclv2.ref-labs.near","wnear":"wrap.near"}}"#, ME));
+                assert_eq!(attached_deposit.as_yoctonear(), 0);
+                assert_eq!(*prepaid_gas, GAS_LOCKER_NEW);
+            }
+            a => panic!("batch {:?}", a),
+        }
+        assert!(!r[0].actions.iter().any(|a| matches!(a, MockAction::AddKeyWithFullAccess { .. } | MockAction::AddKeyWithFunctionCall { .. })), "no key");
+        assert_eq!(r[1].receiver_id, acct(ME), "then the callback");
+        let ev = &logs_with("locker_create")[0];
+        assert!(ev.contains(&format!(r#""locker":"{}""#, lk)) && ev.contains(&hex32(env::sha256_array(&code))) && ev.contains(&all.to_string()));
+
+        ctx_results(vec![near_sdk::PromiseResult::Failed]);
+        assert!(!f.on_locker_created(lk.clone(), U128(all), Err(PromiseError::Failed)));
+        assert_eq!(reserve(), all);
+        assert!(logs_with("locker_create_failed")[0].contains(&format!(r#""reserve":"{}""#, all)));
+        assert_eq!(f.get_next_locker(), acct(&format!("lock_10.{}", ME)));
+        ctx_input("owner.near", &code);
+        drop(f.create_locker());
+        assert_eq!(get_created_receipts()[0].receiver_id, acct(&format!("lock_10.{}", ME)));
+        ctx_results(vec![near_sdk::PromiseResult::Successful(vec![])]);
+        assert!(f.on_locker_created(acct(&format!("lock_10.{}", ME)), U128(all), Ok(())));
+        assert_eq!(reserve(), 0);
+        assert_eq!(logs_with("locker_created").len(), 1);
+    }
+
+    #[test]
+    fn a_new_locker_passes_set_locker_from() {
+        let mut f = factory();
+        ctx("owner.near", 0);
+        let next = f.get_next_locker();
+        assert_eq!(next, acct(&format!("lock_1.{}", ME)), "no lock_N yet: lock_1");
+        f.set_locker_from(next.clone(), U64(f.next_id));
+        assert_eq!(f.get_lockers().last().unwrap().1, next);
+        assert_eq!(f.get_next_locker(), acct(&format!("lock_2.{}", ME)));
     }
 
     #[test]
