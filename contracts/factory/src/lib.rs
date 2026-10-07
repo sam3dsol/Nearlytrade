@@ -2973,6 +2973,22 @@ impl Factory {
 
 
 
+    pub fn upgrade_code(&self) -> Promise {
+        self.assert_owner();
+        let code = env::input().unwrap_or_default();
+        require!(code.starts_with(b"\0asm"), "upgrade_code: the input must be the wasm itself");
+        let hash: CryptoHash = env::sha256_array(&code);
+        emit("upgrade", &format!(r#"{{"code_hash":"{}","migrate":true,"raw":true}}"#, hex32(hash)));
+        Promise::new(env::current_account_id())
+            .deploy_contract(code)
+            .function_call_weight("migrate".to_string(), b"{}".to_vec(), NO_DEPOSIT, GAS_MIGRATE, GasWeight(1))
+    }
+
+
+
+
+
+
     pub fn add_fc_key(&mut self, public_key: PublicKey, methods: Vec<String>, allowance: Option<U128>) -> Promise {
         self.assert_owner();
         require!(!methods.is_empty(), "fc key: list the methods; an empty list allows every method, callbacks included");
@@ -6519,6 +6535,42 @@ mod v6_tests {
 
         let parsed: Base58CryptoHash = near_sdk::serde_json::from_str(&format!("\"{}\"", near_sdk::bs58::encode(hash).into_string())).unwrap();
         assert_eq!(CryptoHash::from(parsed), hash);
+    }
+
+
+    fn ctx_input(who: &str, input: &[u8]) {
+        let mut c = VMContextBuilder::new()
+            .current_account_id(ME.parse().unwrap())
+            .predecessor_account_id(who.parse().unwrap())
+            .account_balance(NearToken::from_near(500))
+            .prepaid_gas(Gas::from_tgas(300))
+            .build();
+        c.input = input.into();
+        near_sdk::testing_env!(c, near_sdk::test_vm_config(), mainnet_fees());
+    }
+
+    #[test]
+    fn upgrade_code_deploys_the_raw_input_then_migrates() {
+        let f = factory();
+        let code = b"\0asm\x01\0\0\0 any module bytes".to_vec();
+        ctx_input("mallory.near", &code);
+        assert_eq!(panics(|| drop(f.upgrade_code())), "owner only");
+        ctx_input(ME, &code);
+        assert_eq!(panics(|| drop(f.upgrade_code())), "owner only", "the factory's own keys are not the owner");
+        ctx_input("owner.near", b"");
+        assert_eq!(panics(|| drop(f.upgrade_code())), "upgrade_code: the input must be the wasm itself");
+        ctx_input("owner.near", br#"{"code":"AGFzbQ=="}"#);
+        assert_eq!(panics(|| drop(f.upgrade_code())), "upgrade_code: the input must be the wasm itself", "JSON or base64 is refused");
+        ctx_input("owner.near", &code);
+        drop(f.upgrade_code());
+        let r = get_created_receipts();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].receiver_id, acct(ME));
+        assert_eq!(r[0].actions.len(), 2);
+        assert!(matches!(&r[0].actions[0], MockAction::DeployContract { code: c, .. } if *c == code), "{:?}", r[0].actions);
+        assert!(matches!(&r[0].actions[1], MockAction::FunctionCallWeight { method_name, attached_deposit, .. } if method_name == b"migrate" && attached_deposit.as_yoctonear() == 0));
+        assert!(logs_with("upgrade")[0].contains(&hex32(env::sha256_array(&code))));
+        assert!(logs_with("upgrade")[0].contains(r#""raw":true"#));
     }
 
     #[test]
