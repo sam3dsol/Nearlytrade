@@ -172,3 +172,26 @@ Mainnet, 2026-10-07:
 | Proposal #5 `UpgradeRemote` to `upgrade_code`, approvals 1 and 2 leave it in progress | `ASWVnKT76rCn9Y1Z3KvtoVJVYuHQe5f9f1fsdWMPeABV`, `BVvuN53dhykhjgK3sbYKmuims8FzrSkCzhfR6pyRyNy3`, `FN1tNRk3Noju2vgU9oErXuiMRNfEtqjaKaZ362AwgopN` |
 | Approval 3 executes: `upgrade` event `aba3be30…` raw, code `CZ1XpbUk…`, views unchanged | `GLbDAGenjZ7h65hdhqYM5hUwZncQQi5VwEYGAAZzFvHP` |
 | `remove_blob`, deposit refunded | `9HfiUsDBPxuDCeRkiG3c7QYJzidtFMbPzvq33XcDpyky` |
+
+## Follow-up (2026-10-07): the owner DAO creates lockers
+
+A locker is a sub-account `lock_N.nearlytrade.near` with no access key, so only the factory account can create one. Until now that took the factory's own key. New owner method `create_locker()`: like `upgrade_code`, its raw call input is the locker wasm (Sputnik's `UpgradeRemote` sends it from the DAO's blob store). In one batch it creates the next `lock_N` (`get_next_locker`), funds it with the whole locker reserve, deploys the code and calls `new(factory, dcl, wnear)`, adding no key. It refuses input that is not wasm and a reserve below the code's storage plus 1 NEAR. If the batch fails the reserve is booked back and that number is skipped. Switching new launches to the locker stays a separate owner call (`set_locker_from`).
+
+The locker reserve is its own balance (`get_locker_reserve`), never creator, holder or protocol money: anyone adds to it with `fund_locker_reserve()` (payable), the owner takes it back with `withdraw_locker_reserve(to, amount)` (a send that bounces is booked back). A locker needs its code's storage (about 2.9 NEAR) and a little for its records; earlier lockers were given 15 NEAR and use about 3.
+
+`upgrade_code`, `upgrade(code_hash)` and `migrate` are unchanged.
+
+Tests: factory 152 (reserve funded by anyone and withdrawn by the owner only, a bounced withdraw booked back; `create_locker` owner only, empty, JSON and short-reserve input refused, the next number after the highest `lock_N`, one batch = create + whole reserve + deploy + `new`, a failed batch re-credits the reserve and skips the number).
+
+Build: factory `56eb79cb…` = `6rJKScfD…` (commit `034a8e4`, README, Build).
+
+Testnet first, on these exact bytes, with the factory owned by a Sputnik DAO: the DAO upgraded the factory to this build, refused calls (owner only, private callbacks, an empty fund, a short reserve, input that is not wasm), a batch whose `new` fails re-credits the reserve with no account made, a real locker created from the `lock_8` code with no key, initialized and registered on the DCL, new launches switched to it, a launch with a dev buy, a trade and a claim on it, the reserve withdrawn.
+
+Mainnet, 2026-10-07, upgraded by the owner DAO (no locker created yet):
+
+| Step | Tx |
+|---|---|
+| `store_blob` of the build in the DAO (returns `6rJKScfD…`) | `HR6dspDmXgicMDoMfQhFvDaxqLRfakTKCUPyePhQfoRZ` |
+| Proposal #7 `UpgradeRemote` to `upgrade_code`, approvals 1 and 2 leave it in progress | `HjicnqPdws3aGBrSxUAqim2ZYrqmxge3vm4w8b3JZ6f`, `5M9sjNoSoLod5Fgk3G23ruCi9RR4UxPsqLQc2ayyDEzN`, `61dKESv3HFkYhrhkKuExWfGGBABAXk4ijwHwkatvXVmt` |
+| Approval 3 executes: `upgrade` event `56eb79cb…` raw, code `6rJKScfD…`, views unchanged | `HMJd2wVyRUNqmtLp9V8G9XZVn2fGGzU4E23Cayiwxiwu` |
+| `remove_blob`, deposit refunded | `2NwkdKRp3bku22Qp39Gh5M7i1Vs8KYzFtHzkUYrq1xEn` |
