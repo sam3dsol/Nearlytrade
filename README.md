@@ -38,6 +38,18 @@ Earlier generations, frozen (they stay live next to the new code). Each folder h
 
 The factory keeps a per-launch locker schedule, so every locker stays in use for its own launches: `get_lockers` returns lock from 0, lock2 from 158, lock3 from 1810, lock4 from 1931, lock_4 from 1935, lock_5 from 2064, lock_6 from 2192, lock_7 from 2549 and lock_8 from 2596. Tokens are published once as NEAR global contracts (by code hash) and every launch deploys its token account against one of those hashes. The earlier token generations stay live for older launches (table above).
 
+## Admin
+
+The factory has no full-access key. Its owner (`get_owner`) is the Sputnik DAO `nearlytrade.sputnik-dao.near` (Sputnik 2.3.1, global code `DtHZA1mUmGYeScEaUoUZYQGGFHSMpnjMCvkr5U9hJXuF`, no access keys, factory auto-update off), so every owner method, upgrades included, runs only through a proposal that passes with 3 of the 4 council votes.
+
+| | |
+|---|---|
+| Council | `nearlyops.near` and `protocolfee2.near` (nearly.trade), `haenko.near` and `rhymetaylor.near` (NEAR Legion), since proposal #13 (2026-10-08) |
+| Threshold | 3 of 4 approvals (role weight, ratio 1/2). Anyone may file a proposal with a 1 NEAR bond; proposals expire after 7 days. |
+| Factory keys | Two function-call keys for the keepers, receiver `nearlytrade.near` only. Fee crank `ed25519:3ngukadkEB9ix1GHhFVz2PbjZGRiJEsxSmXobXYUvumd`: `claim_fees`, `split_protocol_token_fees`, `push_creator_fees`, `push_creator_token_fees`, `push_creator_quote_fees`, `split_protocol_quote_fees`, `buyback`, `pay_holders`, `burn_token_fees`. Tax crank `ed25519:9px7ZzfWejQYex8Czm6FVHHJRr76EYxzhgkNt1ea68mJ`: `collect_tax`, `process_tax`, `pay_tax_holders`, `push_owed`. Neither reaches an owner method. |
+
+The history of every owner change is in `FIXES.md`. Proposal #12, an earlier version of the council change, was replaced by #13 and expires unexecuted on 2026-10-15.
+
 ## Verify the deployed code
 
 All read-only, against `https://rpc.mainnet.fastnear.com`. `<b58>` is the base58 hash from the tables.
@@ -51,7 +63,14 @@ for a in nearlytrade.near lock_8.nearlytrade.near lock_7.nearlytrade.near lock_6
   q '{"jsonrpc":"2.0","id":1,"method":"query","params":{"request_type":"view_account","finality":"final","account_id":"'$a'"}}' | jq -r '.result.code_hash'
   q '{"jsonrpc":"2.0","id":1,"method":"query","params":{"request_type":"view_access_key_list","finality":"final","account_id":"'$a'"}}' | jq '.result.keys|length'
 done
-# expected: nearlytrade.near 6rJKScfD…, lock_8.nearlytrade.near 4CMfhWsU… 0 keys, lock_7.nearlytrade.near EkB8CKVf… 0 keys, lock_6.nearlytrade.near 13KJEWas… 0 keys, lock_5.nearlytrade.near 2vKpZcuE… 0 keys, lock.nearlytrade.near J7eJu1Wr… 0 keys, lock2.nearlytrade.near H2hLLyZ9… 0 keys, lock3 8buG64Gs… 0 keys, lock4 9uhDnu5x… 0 keys, lock_4 BAXUNRds… 0 keys
+# expected: nearlytrade.near 6rJKScfD… 2 keys (function call), lock_8.nearlytrade.near 4CMfhWsU… 0 keys, lock_7.nearlytrade.near EkB8CKVf… 0 keys, lock_6.nearlytrade.near 13KJEWas… 0 keys, lock_5.nearlytrade.near 2vKpZcuE… 0 keys, lock.nearlytrade.near J7eJu1Wr… 0 keys, lock2.nearlytrade.near H2hLLyZ9… 0 keys, lock3 8buG64Gs… 0 keys, lock4 9uhDnu5x… 0 keys, lock_4 BAXUNRds… 0 keys
+
+# owner, council and the factory's keys
+call() { q '{"jsonrpc":"2.0","id":1,"method":"query","params":{"request_type":"call_function","finality":"final","account_id":"'$1'","method_name":"'$2'","args_base64":"e30="}}' | jq -r '.result.result|implode'; }
+call nearlytrade.near get_owner                                                    # nearlytrade.sputnik-dao.near
+call nearlytrade.sputnik-dao.near get_policy | jq -c '.roles, .default_vote_policy'  # council of 4, threshold [1,2]
+call nearlytrade.sputnik-dao.near get_factory_info                                  # auto_update false
+q '{"jsonrpc":"2.0","id":1,"method":"query","params":{"request_type":"view_access_key_list","finality":"final","account_id":"nearlytrade.near"}}' | jq -c '.result.keys[]|[.public_key,.access_key.permission]'
 
 # global contracts: fetch the code by hash and sha256 it
 for h in 54GH1DmZgArERRH2ed8zJBXT7UxdeumaZe8Du8dtYJrt 8GXVnFTxx1d6tYnoqNiQ5YzzQpj1uyxG7u28LeCGmsER DFiuocosGQbx3raMt3ACEauZqLXXYzX77MJNf361385R HS4R2isPS7hnnY8k2QbxnLHUx9Z9v9mNZnLsrGqwhChh 4yLHirATwQvHfn99Vsb98mWMkvVZhjgeJ5ahx4WhC1MZ 5qScjXG9uRG82Yrh36XZNZgVUYiqPtuC9ep5DvV42eGQ B6EjqsNJXfQXYX1KkUaypN8z7KpYcBrf9JNwTVtWUUBY 1uGuBEpx3dFRDrr2wNzm5Vcb5sF3jWY3AKQ3Gopd6we YXJL2KYynDA52JPBpAP5qDZhJqCTfB6dR5Ee4jdEgDK Cct6RbLZAEs5WmKkPFr4qqTAWKKzPhE4aTJHVwNLeGBS; do
@@ -63,7 +82,7 @@ for c in locker-v1 locker-v2 locker3-lock3 locker3-lock4 locker3-lock_4 token-ra
 
 ```
 
-The NEP-330 metadata of the factory and the lockers (`contract_source_metadata`) points at the public repo `sam3dsol/Nearlytrade`; the factory and `lock_7` pin commit `d3c0e525c15d3239794d8eafda76775833e771b0`, `lock_8` pins `a476bbe47a694e2b24e7060738870065882df011`; lock v1's pinned commit no longer exists there after a history rewrite, which is why the rebuild recipe pins the same values by hand.
+The NEP-330 metadata of the factory and the lockers (`contract_source_metadata`) points at the public repo `sam3dsol/Nearlytrade`; the factory pins commit `034a8e459c9e9a021d201b10b0b1c1bad0f9b942`, `lock_7` pins `d3c0e525c15d3239794d8eafda76775833e771b0`, `lock_8` pins `a476bbe47a694e2b24e7060738870065882df011`; lock v1's pinned commit no longer exists there after a history rewrite, which is why the rebuild recipe pins the same values by hand.
 
 ## Build
 
@@ -91,8 +110,8 @@ Frozen contracts: `legacy/rebuild.sh <name>` (see each `legacy/*/README.md`).
 
 ## Tests
 
-- `cargo test -p nearpad-factory`: 148 passed.
-- `cargo test -p nearpad-locker3`: 65 passed.
+- `cargo test -p nearpad-factory`: 152 passed.
+- `cargo test -p nearpad-locker3`: 66 passed.
 - `cargo test -p nearpad-locker-v1` / `-v2`: 6 passed each.
 - Token crates are `near-sys` only and compile for wasm32 alone; they have no host unit tests. Their harnesses:
   - `node contracts/token-tax/sim/tax_in_flight.mjs <token-tax wasm>`: 56 checks of the in-flight tax lock against a simulated host.

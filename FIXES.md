@@ -195,3 +195,23 @@ Mainnet, 2026-10-07, upgraded by the owner DAO (no locker created yet):
 | Proposal #7 `UpgradeRemote` to `upgrade_code`, approvals 1 and 2 leave it in progress | `HjicnqPdws3aGBrSxUAqim2ZYrqmxge3vm4w8b3JZ6f`, `5M9sjNoSoLod5Fgk3G23ruCi9RR4UxPsqLQc2ayyDEzN`, `61dKESv3HFkYhrhkKuExWfGGBABAXk4ijwHwkatvXVmt` |
 | Approval 3 executes: `upgrade` event `56eb79cb…` raw, code `6rJKScfD…`, views unchanged | `HMJd2wVyRUNqmtLp9V8G9XZVn2fGGzU4E23Cayiwxiwu` |
 | `remove_blob`, deposit refunded | `2NwkdKRp3bku22Qp39Gh5M7i1Vs8KYzFtHzkUYrq1xEn` |
+
+## Follow-up (2026-10-08): admin by the owner DAO only, NEAR Legion signers
+
+No code change. The factory's full-access key is deleted, so the owner DAO `nearlytrade.sputnik-dao.near` is the only way to call an owner method or change the code, and two NEAR Legion accounts now sit on its council. ADMIN-KEY-01 is closed: no single key, on the factory or on the DAO, can act as the owner.
+
+| Proposal | Change | Approval that executed it |
+|---|---|---|
+| #1 (2026-10-06) | The DAO accepts ownership of the factory | `FkjHCG18TvxjyHGZbtkQdt5nV4bsEwcnk3y775GbAhc3` |
+| #4 (2026-10-07) | Unused ops key `HXmLoybW3AoxLRMz1wTuSxAYsQXur2aj5t5tG138NC7P` deleted (its methods are owner only) | `FTtRn9Pge4395qRREDHCF8kQiNfskMJiSh8opncGEwTa` |
+| #6 (2026-10-07) | Council: `protocolfee.near`, `protocolfee2.near`, `nearlyops.near`, `nearlyburn.near` (the factory account no longer votes) | `33gkMRnShjdnHuKkbhC9Dady4sBxGDBAR9KSdeQkWbGb` |
+| #8 (2026-10-07) | DAO factory auto-update off: the DAO's own code changes only by its own vote | `CGmdD1ic9CU1grhtxCTibVaQ9p83dtwhqE9NDLew3PkB` |
+| #9 (2026-10-08) | Full-access key `DXa8E81UiyzLmdsAGMaM1u2LjTHybXWPQethfxF8bgRi` deleted | `B4YJLWi9fMrmD5GTMdFMhHBFKXqppkzSjJMY64rMBzHb` |
+| #10 (2026-10-08) | Keeper keys `3ngukadk…` (fee crank) and `9px7ZzfW…` (tax crank) added, the same methods as before, no allowance cap | `7AkQf5X7aDfVy1KxidFSTXeaELpWrYn52ax5Dg7SUPjn` |
+| #11 (2026-10-08) | The earlier keeper keys `C7DvdzCovj9JuymsLpvs1Tsd9v2xbfrQveZ1Q2ifGCy7` and `J97ymEGeyJR5q4iM1zdsQkueXrckG829xMJnaMCSPjiV` deleted | `BryxgS4RzGtLC2e36Y77uGQeqPNUgtJhcS63bjy1h6b6` |
+| #13 (2026-10-08) | Council: `nearlyops.near`, `protocolfee2.near`, `haenko.near`, `rhymetaylor.near` (NEAR Legion), still 3 of 4 | `2qFQmE2t9FXEAUoG58mQmjz3HNNDbXFQL64kWtkqN5xY` |
+
+Every proposal above stayed in progress after its first and second approvals and executed on the third. After #13 the council permissions, the vote policy (role weight, ratio 1/2), the 1 NEAR bond and the 7 day period are unchanged; the factory's owner is the DAO and its keys are the two keeper keys. Proposal #12, an earlier version of the council change with two approvals, was replaced by #13 and expires unexecuted on 2026-10-15.
+
+The keepers ran after each change with no failed calls.
+
