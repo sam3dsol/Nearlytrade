@@ -221,6 +221,11 @@ const _: () = assert!(tg(GAS_BURN) + tg(GAS_BB_BURNED) + 8 <= tg(GAS_BB_AFTER), 
 
 const GAS_TAX_TAKE: Gas = Gas::from_tgas(10);
 
+const GAS_ON_FEES_TO_SELLER: Gas = Gas::from_tgas(12);
+
+const GAS_FEES_TO_SELLER_NEEDS: Gas = Gas::from_tgas(50);
+const _: () = assert!(5 + tg(GAS_DELIVER) + tg(GAS_ON_FEES_TO_SELLER) + 6 <= tg(GAS_FEES_TO_SELLER_NEEDS), "a hand-over must fit its batch and callback");
+
 const GAS_MIGRATE: Gas = Gas::from_tgas(20);
 
 const GAS_LOCKER_NEW: Gas = Gas::from_tgas(30);
@@ -439,6 +444,14 @@ pub struct LaunchArgs {
 
 
     pub fee_to: Option<AccountId>,
+
+
+
+    pub creator_paid_in: Option<String>,
+
+
+
+    pub holders_paid_in: Option<String>,
 }
 
 
@@ -495,6 +508,35 @@ pub struct FeeOpts {
     pub burned: U128,
 
     pub paid_holders: U128,
+}
+
+
+
+#[near(serializers = [json])]
+#[derive(Clone, Debug)]
+pub struct FeeSelling {
+
+    pub creator_paid_in: String,
+
+    pub holders_paid_in: String,
+    pub creator_token_selling: U128,
+    pub creator_token_floor: U128,
+    pub creator_quote_selling: U128,
+    pub creator_quote_floor: U128,
+    pub protocol_token_selling: U128,
+    pub protocol_token_floor: U128,
+    pub protocol_quote_selling: U128,
+    pub protocol_quote_floor: U128,
+    pub holders_pending: U128,
+    pub holders_selling: U128,
+    pub holders_floor: U128,
+
+    pub holders_near: U128,
+    pub tax_holders_pending: U128,
+    pub tax_holders_selling: U128,
+    pub tax_holders_floor: U128,
+
+    pub tax_holders_near: U128,
 }
 
 #[near(serializers = [json])]
@@ -761,6 +803,15 @@ impl Factory {
 
         let fee_to = args.fee_to.clone().filter(|a| *a != creator);
         require!(fee_to.as_ref() != Some(&env::current_account_id()), "fee_to: not the launchpad itself");
+        require!(tax_seller().is_none() || Some(fee_to.clone().unwrap_or_else(|| creator.clone())) != tax_seller(), "fee_to: not the tax seller (it would be paid into the wallet that sells the fees)");
+
+        let paid_in = |v: &Option<String>, what: &str| -> Option<bool> {
+            let x = v.as_deref();
+            require!(matches!(x, None | Some("near") | Some("pair")), format!("{what}: near or pair"));
+            x.map(|x| x == "near")
+        };
+        let creator_near = paid_in(&args.creator_paid_in, "creator_paid_in");
+        let holders_near = paid_in(&args.holders_paid_in, "holders_paid_in");
         let tax = args.tax.clone().filter(|t| t.buy_bps > 0 || t.sell_bps > 0);
         if let Some(t) = &tax {
             require!(t.buy_bps <= MAX_TAX_BPS && t.sell_bps <= MAX_TAX_BPS, "tax: max 4% a side (1% pool fee + 4% = 5%)");
@@ -895,6 +946,12 @@ impl Factory {
         if let Some(to) = &fee_to {
             set_fee_to(id, to);
             emit("fee_to", &format!(r#"{{"id":{},"creator":"{}","to":"{}"}}"#, id, creator, to));
+        }
+        if creator_near.is_some() || holders_near.is_some() {
+            if creator_near == Some(false) { env::storage_write(&creator_in_pair_key(id), &[1]); }
+            if holders_near == Some(true) { env::storage_write(&holders_in_near_key(id), &[1]); }
+            emit("paid_in", &format!(r#"{{"id":{},"creator":"{}","holders":"{}"}}"#, id,
+                if creator_near == Some(false) { "pair" } else { "near" }, if holders_near == Some(true) { "near" } else { "pair" }));
         }
         self.token_index.insert(token, id);
         self.launches.insert(id, l.clone());
@@ -1505,7 +1562,10 @@ impl Factory {
 
 
 
-            if c_quote > 0 && mode == FM_HOLDERS {
+            if c_quote > 0 && mode == FM_HOLDERS && holders_in_near(id) {
+
+                add_counter(&holders_pending_key(id, "holders"), c_quote);
+            } else if c_quote > 0 && mode == FM_HOLDERS {
                 set_mode_bucket(id, mode_bucket(id) + c_quote);
             } else {
                 l.creator_quote_fees = U128(l.creator_quote_fees.0 + if house { 0 } else { c_quote });
@@ -1555,19 +1615,58 @@ impl Factory {
 
     pub fn claim_creator_token_fees(&mut self, launch_id: U64) -> Promise { self.internal_pay_creator(launch_id, "token", true) }
 
-    pub fn push_creator_token_fees(&mut self, launch_id: U64) -> Promise { self.internal_pay_creator(launch_id, "token", false) }
+
+
+
+    pub fn push_creator_token_fees(&mut self, launch_id: U64, min_out: Option<U128>, max_amount: Option<U128>, as_booked: Option<bool>) -> Promise {
+        if as_booked == Some(true) {
+            self.assert_keeper();
+            require!(min_out.is_none() && max_amount.is_none(), "as_booked pays the fees as they are: no min_out or max_amount");
+            return self.internal_pay_creator(launch_id, "token", false);
+        }
+        self.internal_fees_to_seller(launch_id, "creator", "token", min_out, max_amount)
+    }
 
     pub fn claim_creator_quote_fees(&mut self, launch_id: U64) -> Promise { self.internal_pay_creator(launch_id, "quote", true) }
 
-    pub fn push_creator_quote_fees(&mut self, launch_id: U64) -> Promise { self.internal_pay_creator(launch_id, "quote", false) }
+
+
+    pub fn push_creator_quote_fees(&mut self, launch_id: U64, min_out: Option<U128>, max_amount: Option<U128>, as_booked: Option<bool>) -> Promise {
+        let in_pair = creator_in_pair(launch_id.0);
+        if in_pair || as_booked == Some(true) {
+            if !in_pair { self.assert_keeper(); }
+            require!(min_out.is_none() && max_amount.is_none(), "this pays the pair-token fees as they are: no min_out or max_amount");
+            return self.internal_pay_creator(launch_id, "quote", false);
+        }
+        self.internal_fees_to_seller(launch_id, "creator", "quote", min_out, max_amount)
+    }
 
 
 
 
 
-    pub fn split_protocol_token_fees(&mut self, launch_id: U64) { self.internal_split_protocol(launch_id, "token") }
 
-    pub fn split_protocol_quote_fees(&mut self, launch_id: U64) { self.internal_split_protocol(launch_id, "quote") }
+
+
+    pub fn split_protocol_token_fees(&mut self, launch_id: U64, min_out: Option<U128>, max_amount: Option<U128>) {
+        if min_out.is_some() {
+            self.internal_fees_to_seller(launch_id, "protocol", "token", min_out, max_amount).detach();
+            return;
+        }
+        require!(max_amount.is_none(), "max_amount goes with min_out");
+        self.assert_keeper();
+        self.internal_split_protocol(launch_id, "token")
+    }
+
+    pub fn split_protocol_quote_fees(&mut self, launch_id: U64, min_out: Option<U128>, max_amount: Option<U128>) {
+        if min_out.is_some() {
+            self.internal_fees_to_seller(launch_id, "protocol", "quote", min_out, max_amount).detach();
+            return;
+        }
+        require!(max_amount.is_none(), "max_amount goes with min_out");
+        self.assert_keeper();
+        self.internal_split_protocol(launch_id, "quote")
+    }
 
 
 
@@ -1830,9 +1929,22 @@ impl Factory {
 
 
 
-    pub fn pay_holders(&mut self, launch_id: U64, payouts: Vec<(AccountId, U128)>) {
+
+
+
+    pub fn pay_holders(&mut self, launch_id: U64, payouts: Vec<(AccountId, U128)>, min_out: Option<U128>, max_amount: Option<U128>, as_booked: Option<bool>) {
         self.assert_not_paused();
         require!(fee_mode(launch_id.0) == FM_HOLDERS, "not a holders launch");
+        if as_booked == Some(true) {
+            require!(min_out.is_none() && max_amount.is_none(), "as_booked pays the fees as they are: no min_out or max_amount");
+            return self.internal_pay_holders_pending(launch_id, payouts, false);
+        }
+        if min_out.is_some() {
+            require!(payouts.is_empty(), "a sale pays no one: no payouts with min_out");
+            self.internal_fees_to_seller(launch_id, "holders", "quote", min_out, max_amount).detach();
+            return;
+        }
+        require!(max_amount.is_none(), "max_amount goes with min_out");
         self.internal_pay_holders(launch_id, payouts, false)
     }
 
@@ -1947,6 +2059,60 @@ impl Factory {
     }
 
 
+    #[private]
+    pub fn on_fees_to_seller(&mut self, launch_id: U64, share: String, kind: String, amount: U128, floor: U128, #[callback_result] r: Result<(), PromiseError>) -> bool {
+        if let Some(l) = self.launches.get(&launch_id.0) { let t = if kind == "token" { l.token.clone() } else { l.quote.clone() }; transfer_end(&t); }
+        if r.is_err() {
+            set_selling(launch_id.0, &share, &kind, read_counter(&selling_key(launch_id.0, &share, &kind)).saturating_sub(amount.0));
+            take_counter(&sell_floor_key(launch_id.0, &share, &kind), floor.0);
+            self.credit_back(launch_id.0, &share, &kind, amount.0);
+            emit("fees_to_seller_failed", &format!(r#"{{"id":{},"share":"{}","kind":"{}","amount":"{}"}}"#, launch_id.0, share, kind, amount.0));
+            return false;
+        }
+        true
+    }
+
+
+
+
+
+
+    #[payable]
+    pub fn fee_proceeds(&mut self, launch_id: U64, share: String, kind: String, sold: U128) -> bool {
+        self.assert_not_paused();
+        require!(Some(env::predecessor_account_id()) == tax_seller(), "tax seller only");
+        require_share_kind(&share, &kind);
+        let l = self.rec(launch_id.0);
+        require!(!self.sells_for_pair(&l, &share), "this creator is paid in the pair token: send it with ft_transfer_call");
+        self.internal_fees_settle(launch_id.0, &share, &kind, sold.0, env::attached_deposit().as_yoctonear())
+    }
+
+
+
+    pub fn get_fee_selling(&self, launch_id: U64) -> FeeSelling {
+        let id = launch_id.0;
+        let l = self.rec(id);
+        let r = |share: &str, kind: &str| (U128(read_counter(&selling_key(id, share, kind))), U128(read_counter(&sell_floor_key(id, share, kind))));
+        let (ct, ctf) = r("creator", "token");
+        let (cq, cqf) = r("creator", "quote");
+        let (pt, ptf) = r("protocol", "token");
+        let (pq, pqf) = r("protocol", "quote");
+        let (hs, hsf) = r("holders", "quote");
+        let (ts, tsf) = r("tax_holders", "quote");
+        let native = l.quote == self.wnear_id;
+        FeeSelling {
+            creator_paid_in: if self.sells_for_pair(&l, "creator") { "pair" } else { "near" }.to_string(),
+            holders_paid_in: if native || holders_in_near(id) { "near" } else { "pair" }.to_string(),
+            creator_token_selling: ct, creator_token_floor: ctf, creator_quote_selling: cq, creator_quote_floor: cqf,
+            protocol_token_selling: pt, protocol_token_floor: ptf, protocol_quote_selling: pq, protocol_quote_floor: pqf,
+            holders_pending: U128(read_counter(&holders_pending_key(id, "holders"))), holders_selling: hs, holders_floor: hsf,
+            holders_near: U128(read_counter(&holders_near_key(id, "holders"))),
+            tax_holders_pending: U128(read_counter(&holders_pending_key(id, "tax_holders"))), tax_holders_selling: ts, tax_holders_floor: tsf,
+            tax_holders_near: U128(read_counter(&holders_near_key(id, "tax_holders"))),
+        }
+    }
+
+
 
 
 
@@ -1972,6 +2138,33 @@ impl Factory {
             emit("tax_returned", &format!(r#"{{"id":{},"amount":"{}","floor_dropped":"{}"}}"#, id, amount.0, floor_part));
             return PromiseOrValue::Value(U128(0));
         }
+
+
+
+
+        if let Some(id) = m["fee_return"].as_u64() {
+            let share = match m["share"].as_str() { Some("creator") => "creator", Some("protocol") => "protocol", Some("holders") => "holders", Some("tax_holders") => "tax_holders", _ => return refund };
+            let Some(l) = self.launches.get(&id) else { return refund };
+            let from = env::predecessor_account_id();
+            let kind = if from == l.token { "token" } else if from == l.quote && l.quote != self.wnear_id { "quote" } else { return refund };
+            if amount.0 == 0 || (kind == "token" && (share == "holders" || share == "tax_holders")) { return refund; }
+            let held = read_counter(&selling_key(id, share, kind));
+            if amount.0 > held { return refund; }
+            let floor_part = mul_div_wide(read_counter(&sell_floor_key(id, share, kind)), amount.0, held);
+            take_counter(&sell_floor_key(id, share, kind), floor_part);
+            set_selling(id, share, kind, held - amount.0);
+            self.credit_back(id, share, kind, amount.0);
+            emit("fees_returned", &format!(r#"{{"id":{},"share":"{}","kind":"{}","amount":"{}","floor_dropped":"{}"}}"#, id, share, kind, amount.0, floor_part));
+            return PromiseOrValue::Value(U128(0));
+        }
+        if let Some(id) = m["fee_proceeds"].as_u64() {
+            let Some(sold) = m["sold"].as_str().and_then(|x| x.parse::<u128>().ok()) else { return refund };
+            if m["share"].as_str() != Some("creator") || m["kind"].as_str() != Some("token") { return refund; }
+            let Some(l) = self.launches.get(&id).cloned() else { return refund };
+            if l.quote != env::predecessor_account_id() || !self.sells_for_pair(&l, "creator") { return refund; }
+            self.internal_fees_settle(id, "creator", "token", sold, amount.0);
+            return PromiseOrValue::Value(U128(0));
+        }
         let (Some(id), Some(sold)) = (m["tax_proceeds"].as_u64(), m["sold"].as_str().and_then(|x| x.parse::<u128>().ok())) else { return refund };
         let Some(l) = self.launches.get(&id).cloned() else { return refund };
         if l.quote != env::predecessor_account_id() || l.quote == self.wnear_id { return refund; }
@@ -1992,7 +2185,18 @@ impl Factory {
 
 
 
-    pub fn pay_tax_holders(&mut self, launch_id: U64, payouts: Vec<(AccountId, U128)>) {
+
+    pub fn pay_tax_holders(&mut self, launch_id: U64, payouts: Vec<(AccountId, U128)>, min_out: Option<U128>, max_amount: Option<U128>, as_booked: Option<bool>) {
+        if as_booked == Some(true) {
+            require!(min_out.is_none() && max_amount.is_none(), "as_booked pays the fees as they are: no min_out or max_amount");
+            return self.internal_pay_holders_pending(launch_id, payouts, true);
+        }
+        if min_out.is_some() {
+            require!(payouts.is_empty(), "a sale pays no one: no payouts with min_out");
+            self.internal_fees_to_seller(launch_id, "tax_holders", "quote", min_out, max_amount).detach();
+            return;
+        }
+        require!(max_amount.is_none(), "max_amount goes with min_out");
         self.internal_pay_holders(launch_id, payouts, true)
     }
 
@@ -2101,6 +2305,8 @@ impl Factory {
 
     pub fn set_tax_seller(&mut self, account_id: Option<AccountId>) {
         self.assert_owner();
+
+        require!(read_counter(FEE_SLICES_OUT_KEY) == 0, "fee slices are still with the seller: settle or return them first");
         internal_set_tax_seller(account_id);
     }
 
@@ -2196,6 +2402,7 @@ impl Factory {
 
 
         require!(l.creator_token_fees.0 == 0 && l.creator_quote_fees.0 == 0, "pay the creator's booked token and quote fees first");
+        require!(read_counter(&selling_key(launch_id.0, "creator", "token")) == 0 && read_counter(&selling_key(launch_id.0, "creator", "quote")) == 0, "a creator slice is still with the seller");
         set_fee_opts(launch_id.0, FM_BURN, BPS as u16);
         emit("house_buyback_set", &format!(r#"{{"id":{}}}"#, launch_id.0));
     }
@@ -2923,6 +3130,26 @@ impl Factory {
 
 
 
+    pub fn clear_fee_floor(&mut self, launch_id: U64, share: String, kind: String) {
+        self.assert_owner();
+        require_share_kind(&share, &kind);
+        let k = sell_floor_key(launch_id.0, &share, &kind);
+        let floor = read_counter(&k);
+        env::storage_remove(&k);
+        emit("fee_floor_cleared", &format!(r#"{{"id":{},"share":"{}","kind":"{}","floor":"{}"}}"#, launch_id.0, share, kind, floor));
+    }
+
+
+
+    pub fn write_off_fee_slice(&mut self, launch_id: U64, share: String, kind: String) {
+        self.assert_owner();
+        require_share_kind(&share, &kind);
+        let held = read_counter(&selling_key(launch_id.0, &share, &kind));
+        set_selling(launch_id.0, &share, &kind, 0);
+        env::storage_remove(&sell_floor_key(launch_id.0, &share, &kind));
+        emit("fee_slice_written_off", &format!(r#"{{"id":{},"share":"{}","kind":"{}","amount":"{}"}}"#, launch_id.0, share, kind, held));
+    }
+
     pub fn clear_tax_floor(&mut self, launch_id: U64) {
         self.assert_owner();
         let floor = read_counter(&tax_floor_key(launch_id.0));
@@ -3521,10 +3748,12 @@ impl Factory {
             self.assert_not_paused();
         }
         let amount = if kind == "token" {
+            require!(!claim, "a creator is not paid the launch token: its token fees are sold (push_creator_token_fees)");
             require_no_swap(&l.token);
             std::mem::take(&mut l.creator_token_fees).0
         } else {
             require!(l.quote != self.wnear_id, if claim { "NEAR pair: use claim_creator_fees" } else { "NEAR pair: use push_creator_fees" });
+            require!(!claim || creator_in_pair(launch_id.0), "this launch pays its creator in NEAR: its pair-token fees are sold (push_creator_quote_fees)");
             self.guard_quote(&l);
             std::mem::take(&mut l.creator_quote_fees).0
         };
@@ -3584,13 +3813,16 @@ impl Factory {
         self.assert_keeper();
         let l = self.rec(launch_id.0);
 
-        let native = l.quote == self.wnear_id;
+
+        let near_pots = l.quote != self.wnear_id && holders_in_near(launch_id.0);
+        let native = l.quote == self.wnear_id || near_pots;
         if !native { self.guard_quote(&l); }
         let max = if native { MAX_HOLDER_PAYOUTS } else { MAX_FT_HOLDER_PAYOUTS };
         require!(!payouts.is_empty() && payouts.len() <= max, "too many payouts per call (25 NEAR pair, 10 other pairs)");
         require_unique_payees(&payouts);
         let total = payouts.iter().fold(0u128, |a, (_, v)| a.checked_add(v.0).expect("overflow"));
         let (bucket, paid) = if tax { (tax_holders_key(launch_id.0), tax_paid_holders_key(launch_id.0)) } else { (mode_bucket_key(launch_id.0), paid_key(launch_id.0)) };
+        let bucket = if near_pots { holders_near_key(launch_id.0, if tax { "tax_holders" } else { "holders" }) } else { bucket };
         let have = read_counter(&bucket);
         require!(total > 0 && total <= have, "payouts exceed what this launch earned for its holders");
         if have == total { env::storage_remove(&bucket); } else { env::storage_write(&bucket, &(have - total).to_le_bytes()); }
@@ -3600,6 +3832,34 @@ impl Factory {
             if amt.0 > 0 { self.internal_pay(launch_id.0, kind, &who, amt.0, from).detach(); }
         }
         emit(if tax { "tax_holders_paid" } else { "holders_paid" }, &format!(r#"{{"id":{},"amount":"{}"}}"#, launch_id.0, total));
+    }
+
+
+
+
+
+    fn internal_pay_holders_pending(&mut self, launch_id: U64, payouts: Vec<(AccountId, U128)>, tax: bool) {
+        self.assert_not_paused();
+        self.assert_keeper();
+        let id = launch_id.0;
+        let l = self.rec(id);
+        require!(l.quote != self.wnear_id && holders_in_near(id), "only a launch paying its holders in NEAR has a waiting pair-token share");
+        self.guard_quote(&l);
+        require!(!payouts.is_empty() && payouts.len() <= MAX_FT_HOLDER_PAYOUTS, "too many payouts per call (10 other pairs)");
+        require_unique_payees(&payouts);
+        let total = payouts.iter().fold(0u128, |a, (_, v)| a.checked_add(v.0).expect("overflow"));
+        let share = if tax { "tax_holders" } else { "holders" };
+        let pending = holders_pending_key(id, share);
+        let bucket = if tax { tax_holders_key(id) } else { mode_bucket_key(id) };
+        let k = if read_counter(&pending) > 0 { pending } else { bucket };
+        let have = read_counter(&k);
+        require!(total > 0 && total <= have, "payouts exceed what this launch earned for its holders");
+        put_counter(&k, have - total);
+        let from = if tax { "tax_holders" } else { "mode" };
+        for (who, amt) in payouts {
+            if amt.0 > 0 { self.internal_pay(id, "quote", &who, amt.0, from).detach(); }
+        }
+        emit(if tax { "tax_holders_paid" } else { "holders_paid" }, &format!(r#"{{"id":{},"amount":"{}","as_booked":true}}"#, id, total));
     }
 
 
@@ -3721,6 +3981,112 @@ impl Factory {
         self.internal_tax_distribute(launch_id, got)
     }
 
+
+
+
+    fn internal_fees_to_seller(&mut self, launch_id: U64, share: &str, kind: &str, min_out: Option<U128>, max_amount: Option<U128>) -> Promise {
+        self.assert_not_paused();
+        self.assert_keeper();
+        let id = launch_id.0;
+        let floor = min_out.map_or(0, |m| m.0);
+        require!(floor > 0, "min_out required: the floor the seller's proceeds must clear for this slice");
+        require!(gas_left() >= GAS_FEES_TO_SELLER_NEEDS, "attach more gas: a hand-over needs 50 TGas");
+        let seller = tax_seller().expect("no tax seller set");
+        let mut l = self.rec(id);
+        let holders = share == "holders" || share == "tax_holders";
+        if share == "creator" {
+            require!(fee_mode(id) == FM_CREATOR, "this launch's fees go to buyback or holders");
+        }
+        if holders {
+            require!(kind == "quote", "holders are paid from the pair side");
+            require!(l.quote != self.wnear_id, "a NEAR pair pays its holders in NEAR already");
+            require!(holders_in_near(id), "this launch pays its holders in the pair token");
+        }
+        if kind == "token" {
+            require_no_swap(&l.token);
+        } else {
+            require!(l.quote != self.wnear_id, "NEAR pair: its pair side is NEAR already");
+            require!(!self.sells_for_pair(&l, share), "this launch pays its creator the pair token: its pair-token fees are not sold");
+            self.guard_quote(&l);
+        }
+        let have = match (share, kind) {
+            ("creator", "token") => l.creator_token_fees.0,
+            ("creator", _) => l.creator_quote_fees.0,
+            ("protocol", "token") => l.protocol_token_fees.0,
+            ("protocol", _) => l.protocol_quote_fees.0,
+            _ => read_counter(&holders_pending_key(id, share)),
+        };
+        let mut amount = have;
+        if let Some(m) = max_amount {
+            require!(m.0 > 0, "max_amount must be > 0");
+            amount = amount.min(m.0);
+        }
+        require!(amount > 0, "nothing to sell");
+
+        require!(read_counter(&selling_key(id, share, kind)) == 0, "a slice of these fees is still with the seller");
+        match (share, kind) {
+            ("creator", "token") => l.creator_token_fees = U128(have - amount),
+            ("creator", _) => l.creator_quote_fees = U128(have - amount),
+            ("protocol", "token") => l.protocol_token_fees = U128(have - amount),
+            ("protocol", _) => l.protocol_quote_fees = U128(have - amount),
+            _ => put_counter(&holders_pending_key(id, share), have - amount),
+        }
+        self.launches.insert(id, l.clone());
+        set_selling(id, share, kind, amount);
+        put_counter(&sell_floor_key(id, share, kind), floor);
+
+        transfer_start(if kind == "token" { &l.token } else { &l.quote });
+        emit("fees_to_seller", &format!(r#"{{"id":{},"share":"{}","kind":"{}","amount":"{}","floor":"{}"}}"#, id, share, kind, amount, floor));
+        let asset = if kind == "token" { &l.token } else { &l.quote };
+        self.internal_send_tokens(asset, &seller, amount, "fees to sell")
+            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_ON_FEES_TO_SELLER).on_fees_to_seller(launch_id, share.to_string(), kind.to_string(), U128(amount), U128(floor)))
+    }
+
+
+
+
+    fn internal_fees_settle(&mut self, id: u64, share: &str, kind: &str, sold: u128, got: u128) -> bool {
+        let held = read_counter(&selling_key(id, share, kind));
+        require!(sold > 0 && sold <= held, "sold is more than the seller holds for this launch");
+        require!(got > 0, "no proceeds");
+        let floor = mul_div_wide(read_counter(&sell_floor_key(id, share, kind)), sold, held);
+        require!(got >= floor, "proceeds below the keeper's floor for what was sold");
+        take_counter(&sell_floor_key(id, share, kind), floor);
+        set_selling(id, share, kind, held - sold);
+        let l = self.rec(id);
+        let in_pair = self.sells_for_pair(&l, share);
+        emit("fees_sold", &format!(r#"{{"id":{},"share":"{}","kind":"{}","sold":"{}","got":"{}","in":"{}"}}"#, id, share, kind, sold, got, if in_pair { "pair" } else { "near" }));
+        match share {
+            "creator" => self.add_to_bucket(id, if in_pair { "quote" } else { "near" }, "creator", &payee(&l), got),
+            "holders" | "tax_holders" => add_counter(&holders_near_key(id, share), got),
+            _ => {
+                if launch_recipients(id).is_some() {
+                    set_launch_bucket(id, launch_bucket(id) + got);
+                    self.drain_launch_fees(id);
+                } else {
+                    self.protocol_fees += got;
+                    self.drain_protocol_fees();
+                }
+            }
+        }
+        true
+    }
+
+
+    fn credit_back(&mut self, id: u64, share: &str, kind: &str, amount: u128) {
+        if share == "holders" || share == "tax_holders" {
+            add_counter(&holders_pending_key(id, share), amount);
+        } else {
+            let to = payee(&self.rec(id));
+            self.add_to_bucket(id, kind, share, &to, amount);
+        }
+    }
+
+
+    fn sells_for_pair(&self, l: &Launch, share: &str) -> bool {
+        share == "creator" && l.quote != self.wnear_id && creator_in_pair(l.id)
+    }
+
     fn internal_tax_distribute(&mut self, launch_id: U64, got: u128) -> bool {
         let (t, platform_bps) = tax_opts_full(launch_id.0).expect("tax");
         let mut l = self.rec(launch_id.0);
@@ -3748,7 +4114,10 @@ impl Factory {
                 self.launches.insert(launch_id.0, l.clone());
             }
         }
-        if to_holders > 0 {
+        if to_holders > 0 && !native && holders_in_near(launch_id.0) {
+
+            add_counter(&holders_pending_key(launch_id.0, "tax_holders"), to_holders);
+        } else if to_holders > 0 {
             add_counter(&tax_holders_key(launch_id.0), to_holders);
         }
         if to_creator > 0 {
@@ -4367,6 +4736,13 @@ fn hex32(h: CryptoHash) -> String {
     s
 }
 
+
+#[cfg(test)]
+impl Factory {
+    pub fn pay_holders_t(&mut self, launch_id: U64, payouts: Vec<(AccountId, U128)>, min_out: Option<U128>, max_amount: Option<U128>) { self.pay_holders(launch_id, payouts, min_out, max_amount, None) }
+    pub fn pay_tax_holders_t(&mut self, launch_id: U64, payouts: Vec<(AccountId, U128)>, min_out: Option<U128>, max_amount: Option<U128>) { self.pay_tax_holders(launch_id, payouts, min_out, max_amount, None) }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -4550,7 +4926,7 @@ mod tests {
             .build());
         let args = LaunchArgs {
             name: "Doomslug".into(), symbol: "DOOM".into(), icon: None, description: None, links: None,
-            dev_buy: Some(U128(requested)), init_point: None, quote: None, fee_mode: None, creator_share_bps: None, tax: None, fee_to: None,
+            dev_buy: Some(U128(requested)), init_point: None, quote: None, fee_mode: None, creator_share_bps: None, tax: None, fee_to: None, creator_paid_in: None, holders_paid_in: None,
         };
 
         std::mem::forget(f.launch(args));
@@ -4598,7 +4974,7 @@ mod fee_to_tests {
     fn args(sym: &str, fee_to: Option<&str>) -> LaunchArgs {
         LaunchArgs {
             name: sym.into(), symbol: sym.into(), icon: None, description: None, links: None, dev_buy: None, init_point: None,
-            quote: None, fee_mode: None, creator_share_bps: None, tax: None, fee_to: fee_to.map(|a| a.parse().unwrap()),
+            quote: None, fee_mode: None, creator_share_bps: None, tax: None, fee_to: fee_to.map(|a| a.parse().unwrap()), creator_paid_in: None, holders_paid_in: None,
         }
     }
     fn launch(f: &mut Factory, who: &str, sym: &str, fee_to: Option<&str>) -> u64 {
@@ -4652,8 +5028,8 @@ mod fee_to_tests {
         let id = launch(&mut f, "alice.near", "ROUTED", Some("root.near"));
         book_fees(&mut f, id, 0, 5000);
         let token = f.launches.get(&id).unwrap().token.clone();
-        as_caller(&f, "anyone.near", 0);
-        drop(f.push_creator_token_fees(U64(id)));
+        as_caller(&f, "nearlytrade.near", 0);
+        drop(f.push_creator_token_fees(U64(id), None, None, Some(true)));
         let sent: Vec<String> = get_created_receipts().iter().filter(|r| r.receiver_id == token)
             .flat_map(|r| r.actions.iter())
             .filter_map(|a| match a { near_sdk::mock::MockAction::FunctionCallWeight { method_name, args, .. } if method_name == b"ft_transfer" => Some(String::from_utf8(args.clone()).unwrap()), _ => None })
@@ -4663,13 +5039,11 @@ mod fee_to_tests {
 
 
         book_fees(&mut f, id, 0, 5000);
-        as_caller(&f, "alice.near", 0);
-        drop(f.claim_creator_token_fees(U64(id)));
-        let sent: Vec<String> = get_created_receipts().iter().filter(|r| r.receiver_id == token)
-            .flat_map(|r| r.actions.iter())
-            .filter_map(|a| match a { near_sdk::mock::MockAction::FunctionCallWeight { method_name, args, .. } if method_name == b"ft_transfer" => Some(String::from_utf8(args.clone()).unwrap()), _ => None })
-            .collect();
-        assert!(sent.iter().any(|s| s.contains(r#""receiver_id":"root.near""#)));
+        for who in ["alice.near", "root.near"] {
+            as_caller(&f, who, 0);
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(f.claim_creator_token_fees(U64(id)))));
+            assert!(r.is_err(), "{who} pulled launch tokens");
+        }
     }
 
     #[test]
@@ -4757,10 +5131,53 @@ fn fee_to(id: u64) -> Option<AccountId> {
 }
 
 fn payee(l: &Launch) -> AccountId { fee_to(l.id).unwrap_or_else(|| l.creator.clone()) }
+
+
+fn creator_in_pair_key(id: u64) -> Vec<u8> { [b"dp:".as_slice(), &id.to_le_bytes()].concat() }
+fn creator_in_pair(id: u64) -> bool { env::storage_has_key(&creator_in_pair_key(id)) }
+fn holders_in_near_key(id: u64) -> Vec<u8> { [b"hn:".as_slice(), &id.to_le_bytes()].concat() }
+fn holders_in_near(id: u64) -> bool { env::storage_has_key(&holders_in_near_key(id)) }
+
+fn holders_pending_key(id: u64, share: &str) -> Vec<u8> { [if share == "holders" { b"hq:".as_slice() } else { b"ht:".as_slice() }, &id.to_le_bytes()].concat() }
+
+
+fn holders_near_key(id: u64, share: &str) -> Vec<u8> { [if share == "holders" { b"hm:".as_slice() } else { b"hy:".as_slice() }, &id.to_le_bytes()].concat() }
+
+
+fn selling_key(id: u64, share: &str, kind: &str) -> Vec<u8> {
+    let p: &[u8] = match (share, kind) {
+        ("creator", "token") => b"cs:", ("creator", _) => b"cq:", ("protocol", "token") => b"pt:", ("protocol", _) => b"pq:",
+        ("holders", _) => b"hs:", _ => b"hu:",
+    };
+    [p, &id.to_le_bytes()].concat()
+}
+fn sell_floor_key(id: u64, share: &str, kind: &str) -> Vec<u8> {
+    let p: &[u8] = match (share, kind) {
+        ("creator", "token") => b"cf:", ("creator", _) => b"cg:", ("protocol", "token") => b"pf:", ("protocol", _) => b"pg:",
+        ("holders", _) => b"hf:", _ => b"hv:",
+    };
+    [p, &id.to_le_bytes()].concat()
+}
 fn mode_name(m: u8) -> &'static str { match m { FM_BURN => "burn", FM_HOLDERS => "holders", _ => "creator" } }
 fn read_counter(k: &[u8]) -> u128 { env::storage_read(k).map(|b| u128::from_le_bytes(b.try_into().expect("counter"))).unwrap_or(0) }
 fn add_counter(k: &[u8], v: u128) { env::storage_write(k, &(read_counter(k) + v).to_le_bytes()); }
 fn sub_counter(k: &[u8], v: u128) { env::storage_write(k, &read_counter(k).saturating_sub(v).to_le_bytes()); }
+
+fn put_counter(k: &[u8], v: u128) { if v == 0 { env::storage_remove(k); } else { env::storage_write(k, &v.to_le_bytes()); } }
+fn take_counter(k: &[u8], v: u128) { put_counter(k, read_counter(k).saturating_sub(v)) }
+fn require_share_kind(share: &str, kind: &str) {
+    require!(matches!(share, "creator" | "protocol" | "holders" | "tax_holders"), "share: creator, protocol, holders or tax_holders");
+    require!(kind == "token" || kind == "quote", "kind: token or quote");
+    require!(kind == "quote" || !share.ends_with("holders"), "holders are paid from the pair side");
+}
+
+const FEE_SLICES_OUT_KEY: &[u8] = b"fso";
+fn set_selling(id: u64, share: &str, kind: &str, v: u128) {
+    let k = selling_key(id, share, kind);
+    let was = read_counter(&k);
+    put_counter(&k, v);
+    if was == 0 && v > 0 { add_counter(FEE_SLICES_OUT_KEY, 1) } else if was > 0 && v == 0 { take_counter(FEE_SLICES_OUT_KEY, 1) }
+}
 fn mode_bucket(id: u64) -> u128 { read_counter(&mode_bucket_key(id)) }
 fn set_mode_bucket(id: u64, v: u128) {
     if v == 0 { env::storage_remove(&mode_bucket_key(id)); } else { env::storage_write(&mode_bucket_key(id), &v.to_le_bytes()); }
@@ -5000,7 +5417,7 @@ mod v6_tests {
     pub(super) fn args(sym: &str) -> LaunchArgs {
         LaunchArgs {
             name: sym.into(), symbol: sym.into(), icon: None, description: None, links: None, dev_buy: None, init_point: None,
-            quote: None, fee_mode: None, creator_share_bps: None, tax: None, fee_to: None,
+            quote: None, fee_mode: None, creator_share_bps: None, tax: None, fee_to: None, creator_paid_in: None, holders_paid_in: None,
         }
     }
     pub(super) fn launch_with(f: &mut Factory, who: &str, a: LaunchArgs) -> u64 {
@@ -5760,9 +6177,9 @@ mod v6_tests {
 
         ctx("owner.near", 0);
         let eleven: Vec<(AccountId, U128)> = (0..11).map(|i| (acct(&format!("h{i}.near")), U128(1))).collect();
-        assert!(panics(|| f.pay_holders(U64(id), eleven)).contains("too many payouts"));
+        assert!(panics(|| f.pay_holders_t(U64(id), eleven, None, None)).contains("too many payouts"));
         ctx("owner.near", 0);
-        f.pay_holders(U64(id), vec![(acct("a.near"), U128(400)), (acct("b.near"), U128(100))]);
+        f.pay_holders_t(U64(id), vec![(acct("a.near"), U128(400)), (acct("b.near"), U128(100))], None, None);
         assert_eq!((mode_bucket(id), read_counter(&paid_key(id))), (200, 500));
         let c = calls();
         assert!(c.iter().any(|c| c.0 == "usdc.near" && c.1 == "ft_transfer" && c.2.contains(r#""receiver_id":"a.near""#) && c.2.contains(r#""amount":"400""#)), "{c:?}");
@@ -5780,7 +6197,7 @@ mod v6_tests {
         park(&mut f, nid, Step::Done);
         set_mode_bucket(nid, 1_000);
         ctx("owner.near", 0);
-        f.pay_holders(U64(nid), vec![(acct("a.near"), U128(10))]);
+        f.pay_holders_t(U64(nid), vec![(acct("a.near"), U128(10))], None, None);
         assert_eq!(transfers(), vec![("a.near".to_string(), 10)]);
     }
 
@@ -6016,6 +6433,429 @@ mod v6_tests {
         assert!(read_counter(&tax_floor_key(id3)) >= floor / 2 && read_counter(&tax_floor_key(id3)) <= floor / 2 + 1, "half the floor is left");
     }
 
+
+
+    fn launch_paid(f: &mut Factory, sym: &str, quote: Option<AccountId>, mode: Option<&str>, creator: Option<&str>, holders: Option<&str>) -> u64 {
+        let a = LaunchArgs { quote, fee_mode: mode.map(|m| m.to_string()), creator_paid_in: creator.map(|c| c.to_string()), holders_paid_in: holders.map(|h| h.to_string()), ..args(sym) };
+        let id = launch_with(f, "alice.near", a);
+        park(f, id, Step::Done);
+        id
+    }
+    fn book(f: &mut Factory, id: u64, ct: u128, cq: u128, pt: u128, pq: u128) {
+        let mut x = l(f, id);
+        x.creator_token_fees = U128(ct);
+        x.creator_quote_fees = U128(cq);
+        x.protocol_token_fees = U128(pt);
+        x.protocol_quote_fees = U128(pq);
+        f.launches.insert(id, x);
+    }
+    fn sent_to(asset: &str, to: &str, amount: u128) -> bool {
+        calls().iter().any(|x| x.0 == asset && x.1 == "ft_transfer" && x.2.contains(&format!(r#""receiver_id":"{}""#, to)) && x.2.contains(&format!(r#""amount":"{}""#, amount)))
+    }
+    const NO_TOKEN: &str = "a creator is not paid the launch token: its token fees are sold (push_creator_token_fees)";
+    const QUOTE_SOLD: &str = "this launch pays its creator in NEAR: its pair-token fees are sold (push_creator_quote_fees)";
+    const NEED_FLOOR: &str = "min_out required: the floor the seller's proceeds must clear for this slice";
+    fn keeper() { ctx("owner.near", 0); }
+    fn to_seller(f: &mut Factory, id: u64, share: &str, kind: &str, amount: u128, floor: u128) {
+        ctx(ME, 0);
+        assert!(f.on_fees_to_seller(U64(id), share.into(), kind.into(), U128(amount), U128(floor), Ok(())));
+    }
+
+    #[test]
+    fn a_creator_is_paid_in_near_by_default_on_every_pair_never_the_launch_token() {
+        let mut f = factory();
+        near_sdk::env::storage_write(TAX_SELLER_KEY, b"seller.near");
+        let usdc = usdc_pair(&mut f);
+
+        let n = launch_paid(&mut f, "CNN", None, None, None, None);
+        let tn = l(&f, n).token.clone();
+        book(&mut f, n, 10_000, 0, 0, 0);
+        assert_eq!((f.get_fee_selling(U64(n)).creator_paid_in.as_str(), f.get_fee_selling(U64(n)).holders_paid_in.as_str()), ("near", "near"));
+        ctx("alice.near", 0);
+        assert_eq!(panics(|| drop(f.claim_creator_token_fees(U64(n)))), NO_TOKEN);
+        ctx("bob.near", 0);
+        assert_eq!(panics(|| drop(f.push_creator_token_fees(U64(n), None, None, None))), "keeper only");
+        keeper();
+        assert_eq!(panics(|| drop(f.push_creator_token_fees(U64(n), None, None, None))), NEED_FLOOR);
+        keeper();
+        assert_eq!(panics(|| drop(f.push_creator_quote_fees(U64(n), Some(U128(1)), None, None))), "NEAR pair: its pair side is NEAR already");
+        keeper();
+        drop(f.push_creator_token_fees(U64(n), Some(U128(900)), Some(U128(6_000)), None));
+        assert!(sent_to(tn.as_str(), "seller.near", 6_000) && !sent_to(tn.as_str(), "alice.near", 6_000));
+        assert_eq!(l(&f, n).creator_token_fees.0, 4_000, "the rest stays the creator's, in the factory");
+        let fs = f.get_fee_selling(U64(n));
+        assert_eq!((fs.creator_token_selling.0, fs.creator_token_floor.0), (6_000, 900));
+        to_seller(&mut f, n, "creator", "token", 6_000, 900);
+        let c0 = f.get_creator_fees(acct("alice.near")).0;
+        ctx("seller.near", 1_000);
+        assert!(f.fee_proceeds(U64(n), "creator".into(), "token".into(), U128(6_000)));
+        assert_eq!(f.get_creator_fees(acct("alice.near")).0, c0 + 1_000, "the creator's NEAR, paid by push_creator_fees");
+
+        ctx("bob.near", 0);
+        assert_eq!(panics(|| drop(f.push_creator_token_fees(U64(n), None, None, Some(true)))), "keeper only");
+        keeper();
+        drop(f.push_creator_token_fees(U64(n), None, None, Some(true)));
+        assert!(sent_to(tn.as_str(), "alice.near", 4_000));
+
+        let u = launch_paid(&mut f, "CNU", Some(usdc.clone()), None, None, None);
+        let tu = l(&f, u).token.clone();
+        book(&mut f, u, 10_000, 5_000, 0, 0);
+        assert_eq!(f.get_fee_selling(U64(u)).holders_paid_in, "pair");
+        ctx("alice.near", 0);
+        assert_eq!(panics(|| drop(f.claim_creator_quote_fees(U64(u)))), QUOTE_SOLD);
+        ctx("bob.near", 0);
+        assert_eq!(panics(|| drop(f.push_creator_quote_fees(U64(u), None, None, None))), "keeper only");
+        keeper();
+        drop(f.push_creator_token_fees(U64(u), Some(U128(900)), None, None));
+        assert!(sent_to(tu.as_str(), "seller.near", 10_000));
+        to_seller(&mut f, u, "creator", "token", 10_000, 900);
+
+        ctx("usdc.near", 0);
+        let msg = format!(r#"{{"fee_proceeds":{},"share":"creator","kind":"token","sold":"10000"}}"#, u);
+        assert!(matches!(f.ft_on_transfer(acct("seller.near"), U128(1_000), msg), PromiseOrValue::Value(U128(1_000))));
+        let c0 = f.get_creator_fees(acct("alice.near")).0;
+        ctx("seller.near", 1_000);
+        assert!(f.fee_proceeds(U64(u), "creator".into(), "token".into(), U128(10_000)));
+        keeper();
+        drop(f.push_creator_quote_fees(U64(u), Some(U128(400)), None, None));
+        assert!(sent_to("usdc.near", "seller.near", 5_000) && !sent_to("usdc.near", "alice.near", 5_000));
+        to_seller(&mut f, u, "creator", "quote", 5_000, 400);
+        ctx("seller.near", 450);
+        assert!(f.fee_proceeds(U64(u), "creator".into(), "quote".into(), U128(5_000)));
+        assert_eq!(f.get_creator_fees(acct("alice.near")).0, c0 + 1_450, "both sides arrive as NEAR");
+        let fs = f.get_fee_selling(U64(u));
+        assert_eq!((l(&f, u).creator_token_fees.0, l(&f, u).creator_quote_fees.0, fs.creator_token_selling.0, fs.creator_quote_selling.0, fs.creator_quote_floor.0), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn a_creator_who_chose_the_pair_token_is_paid_it_and_never_the_launch_token() {
+        let mut f = factory();
+        near_sdk::env::storage_write(TAX_SELLER_KEY, b"seller.near");
+        let usdc = usdc_pair(&mut f);
+        let p = launch_paid(&mut f, "CPP", Some(usdc.clone()), None, Some("pair"), Some("near"));
+        let tp = l(&f, p).token.clone();
+        assert!(logs_with("paid_in")[0].contains(r#""creator":"pair","holders":"near""#));
+        assert_eq!((f.get_fee_selling(U64(p)).creator_paid_in.as_str(), f.get_fee_selling(U64(p)).holders_paid_in.as_str()), ("pair", "near"));
+        book(&mut f, p, 10_000, 5_000, 0, 0);
+        ctx("alice.near", 0);
+        assert_eq!(panics(|| drop(f.claim_creator_token_fees(U64(p)))), NO_TOKEN);
+
+        keeper();
+        assert_eq!(panics(|| drop(f.push_creator_quote_fees(U64(p), Some(U128(1)), None, None))), "this pays the pair-token fees as they are: no min_out or max_amount");
+        ctx("bob.near", 0);
+        drop(f.push_creator_quote_fees(U64(p), None, None, None));
+        assert!(sent_to("usdc.near", "alice.near", 5_000));
+
+        keeper();
+        drop(f.push_creator_token_fees(U64(p), Some(U128(900)), None, None));
+        assert!(sent_to(tp.as_str(), "seller.near", 10_000));
+        to_seller(&mut f, p, "creator", "token", 10_000, 900);
+        ctx("seller.near", 1_000);
+        assert_eq!(panics(|| drop(f.fee_proceeds(U64(p), "creator".into(), "token".into(), U128(10_000)))), "this creator is paid in the pair token: send it with ft_transfer_call");
+        let msg = |sold: u128| format!(r#"{{"fee_proceeds":{},"share":"creator","kind":"token","sold":"{}"}}"#, p, sold);
+        ctx("usdc.near", 0);
+        assert_eq!(panics(|| drop(f.ft_on_transfer(acct("seller.near"), U128(449), msg(5_000)))), "proceeds below the keeper's floor for what was sold");
+        ctx("wrap.near", 0);
+        assert!(matches!(f.ft_on_transfer(acct("seller.near"), U128(1_000), msg(5_000)), PromiseOrValue::Value(U128(1_000))), "not the pair token");
+        ctx("usdc.near", 0);
+        assert!(matches!(f.ft_on_transfer(acct("bob.near"), U128(1_000), msg(5_000)), PromiseOrValue::Value(U128(1_000))), "not the seller");
+        ctx("usdc.near", 0);
+        assert!(matches!(f.ft_on_transfer(acct("seller.near"), U128(1_000), msg(10_000)), PromiseOrValue::Value(U128(0))));
+        assert_eq!(l(&f, p).creator_quote_fees.0, 1_000, "booked as the creator's pair-token fees");
+
+        ctx("alice.near", 0);
+        drop(f.claim_creator_quote_fees(U64(p)));
+        assert!(sent_to("usdc.near", "alice.near", 1_000));
+
+        let q = launch_paid(&mut f, "CPN", None, None, Some("pair"), None);
+        assert_eq!(f.get_fee_selling(U64(q)).creator_paid_in, "near");
+        book(&mut f, q, 3_000, 0, 0, 0);
+        keeper();
+        drop(f.push_creator_token_fees(U64(q), Some(U128(10)), None, None));
+        to_seller(&mut f, q, "creator", "token", 3_000, 10);
+        ctx("seller.near", 50);
+        assert!(f.fee_proceeds(U64(q), "creator".into(), "token".into(), U128(3_000)));
+    }
+
+    #[test]
+    fn the_protocol_is_paid_in_near_on_every_pair_or_splits_tokens_as_before() {
+        let mut f = factory();
+        near_sdk::env::storage_write(TAX_SELLER_KEY, b"seller.near");
+        let usdc = usdc_pair(&mut f);
+        keeper();
+        f.set_protocol_recipients(vec![(acct("p1.near"), 5000), (acct("p2.near"), 5000)]);
+        let tenth = 10u128.pow(23);
+        let a = launch_paid(&mut f, "PRA", None, None, None, None);
+        let ta = l(&f, a).token.clone();
+        book(&mut f, a, 0, 0, 10_000, 0);
+        ctx("bob.near", 0);
+        assert_eq!(panics(|| f.split_protocol_token_fees(U64(a), Some(U128(900)), None)), "keeper only");
+        keeper();
+        f.split_protocol_token_fees(U64(a), Some(U128(900)), None);
+        assert!(sent_to(ta.as_str(), "seller.near", 10_000));
+        assert_eq!(l(&f, a).protocol_token_fees.0, 0);
+        to_seller(&mut f, a, "protocol", "token", 10_000, 900);
+        ctx("seller.near", tenth);
+        assert!(f.fee_proceeds(U64(a), "protocol".into(), "token".into(), U128(10_000)));
+        let t = transfers();
+        assert!(t.contains(&("p1.near".to_string(), tenth / 2)) && t.contains(&("p2.near".to_string(), tenth / 2)), "{t:?}");
+        assert_eq!(f.get_protocol_fees().0, 0);
+
+        let b = launch_paid(&mut f, "PRB", Some(usdc.clone()), None, None, None);
+        keeper();
+        f.set_launch_recipients(U64(b), Some(vec![(acct("r1.near"), 4000), (acct("r2.near"), 6000)]));
+        book(&mut f, b, 0, 0, 0, 8_000);
+        keeper();
+        f.split_protocol_quote_fees(U64(b), Some(U128(700)), None);
+        assert!(sent_to("usdc.near", "seller.near", 8_000) && !sent_to("usdc.near", "r1.near", 3_200));
+        to_seller(&mut f, b, "protocol", "quote", 8_000, 700);
+        ctx("seller.near", tenth);
+        assert!(f.fee_proceeds(U64(b), "protocol".into(), "quote".into(), U128(8_000)));
+        let t = transfers();
+        assert!(t.contains(&("r1.near".to_string(), tenth * 4 / 10)) && t.contains(&("r2.near".to_string(), tenth * 6 / 10)), "{t:?}");
+
+        let c = launch_paid(&mut f, "PRC", None, None, None, None);
+        let tc = l(&f, c).token.clone();
+        book(&mut f, c, 0, 0, 1_000, 0);
+        ctx("bob.near", 0);
+        assert_eq!(panics(|| f.split_protocol_token_fees(U64(c), None, Some(U128(5)))), "max_amount goes with min_out");
+        ctx("bob.near", 0);
+        assert_eq!(panics(|| f.split_protocol_token_fees(U64(c), None, None)), "keeper only", "anyone splitting the protocol's tokens ahead of the sale is refused");
+        keeper();
+        f.split_protocol_token_fees(U64(c), None, None);
+        assert!(sent_to(tc.as_str(), "p1.near", 500) && sent_to(tc.as_str(), "p2.near", 500));
+    }
+
+    #[test]
+    fn holders_who_are_paid_in_near_get_their_pair_token_share_sold_first() {
+        let mut f = factory();
+        near_sdk::env::storage_write(TAX_SELLER_KEY, b"seller.near");
+        let usdc = usdc_pair(&mut f);
+        let h = launch_with(&mut f, "alice.near", LaunchArgs { quote: Some(usdc.clone()), fee_mode: Some("holders".into()), holders_paid_in: Some("near".into()), ..args("HNR") });
+        let mut lz = l(&f, h);
+        lz.step = Step::Done;
+        lz.inflight = true;
+        f.launches.insert(h, lz);
+
+        let v = if l(&f, h).token_is_x { vec![U128(0), U128(1_000)] } else { vec![U128(1_000), U128(0)] };
+        ctx_gas(ME, 100);
+        assert!(f.on_fees_claimed(h, Ok(v)));
+        let fs = f.get_fee_selling(U64(h));
+        assert_eq!((mode_bucket(h), fs.holders_pending.0, l(&f, h).protocol_quote_fees.0, fs.holders_paid_in.as_str()), (0, 700, 300, "near"));
+        keeper();
+        assert_eq!(panics(|| f.pay_holders_t(U64(h), vec![(acct("a.near"), U128(1))], None, None)), "payouts exceed what this launch earned for its holders");
+        ctx("bob.near", 0);
+        assert_eq!(panics(|| f.pay_holders_t(U64(h), vec![], Some(U128(60)), None)), "keeper only");
+        keeper();
+        assert_eq!(panics(|| f.pay_holders_t(U64(h), vec![(acct("a.near"), U128(1))], Some(U128(60)), None)), "a sale pays no one: no payouts with min_out");
+        keeper();
+        assert_eq!(panics(|| f.pay_holders_t(U64(h), vec![(acct("a.near"), U128(1))], None, Some(U128(5)))), "max_amount goes with min_out");
+        keeper();
+        f.pay_holders_t(U64(h), vec![], Some(U128(60)), None);
+        assert!(sent_to("usdc.near", "seller.near", 700));
+        to_seller(&mut f, h, "holders", "quote", 700, 60);
+        let tenth = 10u128.pow(23);
+        ctx("seller.near", tenth);
+        assert!(f.fee_proceeds(U64(h), "holders".into(), "quote".into(), U128(700)));
+        assert_eq!((mode_bucket(h), f.get_fee_selling(U64(h)).holders_near.0), (0, tenth), "the NEAR waits in its own pot, never the pair-token bucket");
+
+        keeper();
+        f.pay_holders_t(U64(h), vec![(acct("a.near"), U128(tenth * 6 / 10)), (acct("b.near"), U128(tenth * 4 / 10))], None, None);
+        assert_eq!(transfers(), vec![("a.near".to_string(), tenth * 6 / 10), ("b.near".to_string(), tenth * 4 / 10)]);
+        assert!(!calls().iter().any(|c| c.0 == "usdc.near"), "no USDC to holders");
+
+        ctx_results(vec![near_sdk::PromiseResult::Failed]);
+        f.on_paid(U64(h), "near".into(), acct("b.near"), U128(tenth * 4 / 10), "mode".into(), false);
+        assert_eq!(f.get_owed("near".into(), acct("b.near")).0, tenth * 4 / 10);
+
+        let t = launch_with(&mut f, "alice.near", LaunchArgs { quote: Some(usdc.clone()), holders_paid_in: Some("near".into()), ..args("HNT") });
+        park(&mut f, t, Step::Done);
+        set_tax_opts(t, &TaxArgs { buy_bps: 300, sell_bps: 300, creator_bps: 5000, burn_bps: 2000, holders_bps: 3000 }, 2_000);
+        add_counter(&tax_pending_key(t), 10_000);
+        keeper();
+        drop(f.process_tax(U64(t), U128(900), None, None));
+        ctx(ME, 0);
+        assert!(f.on_tax_to_seller(U64(t), U128(8_400), Some(U128(900)), Ok(())));
+        ctx("usdc.near", 0);
+        assert!(matches!(f.ft_on_transfer(acct("seller.near"), U128(1_000), format!(r#"{{"tax_proceeds":{},"sold":"8400"}}"#, t)), PromiseOrValue::Value(U128(0))));
+        let pend = f.get_fee_selling(U64(t)).tax_holders_pending.0;
+        assert!(pend > 0 && f.get_fee_selling(U64(t)).tax_holders_near.0 == 0, "the holders' USDC waits to be sold, nothing in their pot yet");
+        keeper();
+        f.pay_tax_holders_t(U64(t), vec![], Some(U128(10)), None);
+        assert!(sent_to("usdc.near", "seller.near", pend));
+        to_seller(&mut f, t, "tax_holders", "quote", pend, 10);
+        ctx("seller.near", tenth);
+        assert!(f.fee_proceeds(U64(t), "tax_holders".into(), "quote".into(), U128(pend)));
+        assert_eq!((f.get_tax(U64(t)).unwrap().holders_bucket.0, f.get_fee_selling(U64(t)).tax_holders_near.0), (0, tenth));
+        keeper();
+        f.pay_tax_holders_t(U64(t), vec![(acct("c.near"), U128(tenth))], None, None);
+        assert_eq!(transfers(), vec![("c.near".to_string(), tenth)]);
+
+        let d = launch_paid(&mut f, "HND", Some(usdc.clone()), Some("holders"), None, None);
+        add_counter(&holders_pending_key(d, "holders"), 5);
+        keeper();
+        assert_eq!(panics(|| f.pay_holders_t(U64(d), vec![], Some(U128(1)), None)), "this launch pays its holders in the pair token");
+    }
+
+
+    #[test]
+    fn audit_fixes_one_slice_per_pile_seller_guard_two_leg_return_and_escapes() {
+        let mut f = factory();
+        near_sdk::env::storage_write(TAX_SELLER_KEY, b"seller.near");
+        let usdc = usdc_pair(&mut f);
+
+        let u = launch_paid(&mut f, "AFU", Some(usdc.clone()), None, None, None);
+        let tu = l(&f, u).token.clone();
+        book(&mut f, u, 10_000, 0, 0, 0);
+        keeper();
+        drop(f.push_creator_token_fees(U64(u), Some(U128(900)), Some(U128(4_000)), None));
+        assert!(transfers_pending(&tu), "a hand-over is a transfer in flight for the token: no buyback measures it meanwhile");
+        keeper();
+        assert_eq!(panics(|| drop(f.push_creator_token_fees(U64(u), Some(U128(900)), None, None))), "a slice of these fees is still with the seller");
+
+        keeper();
+        assert_eq!(panics(|| f.set_tax_seller(Some(acct("other.near")))), "fee slices are still with the seller: settle or return them first");
+        to_seller(&mut f, u, "creator", "token", 4_000, 900);
+        assert!(!transfers_pending(&tu));
+
+        ctx("bob.near", 0);
+        assert_eq!(panics(|| f.write_off_fee_slice(U64(u), "creator".into(), "token".into())), "owner only");
+        keeper();
+        f.write_off_fee_slice(U64(u), "creator".into(), "token".into());
+        let fs = f.get_fee_selling(U64(u));
+        assert_eq!((fs.creator_token_selling.0, fs.creator_token_floor.0, read_counter(FEE_SLICES_OUT_KEY)), (0, 0, 0));
+        keeper();
+        assert_eq!(panics(|| f.clear_fee_floor(U64(u), "dev".into(), "token".into())), "share: creator, protocol, holders or tax_holders");
+
+        ctx("usdc.near", 0);
+        assert!(matches!(f.ft_on_transfer(acct("seller.near"), U128(70), format!(r#"{{"fee_return":{},"share":"creator","sold":"1"}}"#, u)), PromiseOrValue::Value(U128(70))));
+        keeper();
+        f.set_tax_seller(Some(acct("seller.near")));
+
+        let h = launch_with(&mut f, "alice.near", LaunchArgs { quote: Some(usdc.clone()), fee_mode: Some("holders".into()), holders_paid_in: Some("near".into()), ..args("AFH") });
+        park(&mut f, h, Step::Done);
+        add_counter(&holders_pending_key(h, "holders"), 500);
+        ctx("bob.near", 0);
+        assert_eq!(panics(|| f.pay_holders(U64(h), vec![(acct("a.near"), U128(300))], None, None, Some(true))), "keeper only");
+        keeper();
+        f.pay_holders(U64(h), vec![(acct("a.near"), U128(300))], None, None, Some(true));
+        assert!(sent_to("usdc.near", "a.near", 300));
+        assert_eq!(f.get_fee_selling(U64(h)).holders_pending.0, 200);
+
+        set_mode_bucket(h, 90);
+        keeper();
+        f.pay_holders(U64(h), vec![(acct("b.near"), U128(200))], None, None, Some(true));
+        keeper();
+        f.pay_holders(U64(h), vec![(acct("c.near"), U128(90))], None, None, Some(true));
+        assert!(sent_to("usdc.near", "c.near", 90));
+        assert_eq!((f.get_fee_selling(U64(h)).holders_pending.0, mode_bucket(h)), (0, 0));
+
+        ctx("alice.near", f.quote_launch(0, None, Some(false)).total.0);
+        assert_eq!(panics(|| drop(f.launch(LaunchArgs { fee_to: Some(acct("seller.near")), ..args("AFS") }))), "fee_to: not the tax seller (it would be paid into the wallet that sells the fees)");
+        ctx("seller.near", f.quote_launch(0, None, Some(false)).total.0);
+        assert_eq!(panics(|| drop(f.launch(args("AFT")))), "fee_to: not the tax seller (it would be paid into the wallet that sells the fees)", "nor can the seller launch and be paid");
+
+        let n = launch_paid(&mut f, "AFN", None, None, None, None);
+        book(&mut f, n, 1_000, 0, 0, 0);
+        keeper();
+        drop(f.push_creator_token_fees(U64(n), Some(U128(500)), None, None));
+        ctx("bob.near", 0);
+        assert_eq!(panics(|| f.clear_fee_floor(U64(n), "creator".into(), "token".into())), "owner only");
+        keeper();
+        f.clear_fee_floor(U64(n), "creator".into(), "token".into());
+        assert_eq!(f.get_fee_selling(U64(n)).creator_token_floor.0, 0);
+
+        to_seller(&mut f, n, "creator", "token", 1_000, 0);
+        ctx("seller.near", 1);
+        assert!(f.fee_proceeds(U64(n), "creator".into(), "token".into(), U128(1_000)));
+        assert!(!near_sdk::env::storage_has_key(&selling_key(n, "creator", "token")) && !near_sdk::env::storage_has_key(&sell_floor_key(n, "creator", "token")));
+    }
+
+    #[test]
+    fn floors_returns_and_failed_handovers_for_every_share() {
+        let mut f = factory();
+        near_sdk::env::storage_write(TAX_SELLER_KEY, b"seller.near");
+        let usdc = usdc_pair(&mut f);
+        let c = launch_paid(&mut f, "FRC", None, None, None, None);
+        let tc = l(&f, c).token.clone();
+        book(&mut f, c, 10_000, 0, 0, 0);
+        keeper();
+        drop(f.push_creator_token_fees(U64(c), Some(U128(900)), None, None));
+        to_seller(&mut f, c, "creator", "token", 10_000, 900);
+        let fp = |f: &mut Factory, share: &str, kind: &str, sold: u128| drop(f.fee_proceeds(U64(c), share.into(), kind.into(), U128(sold)));
+        ctx("bob.near", 1_000);
+        assert_eq!(panics(|| fp(&mut f, "creator", "token", 5_000)), "tax seller only");
+        ctx("seller.near", 1_000);
+        assert_eq!(panics(|| fp(&mut f, "dev", "token", 5_000)), "share: creator, protocol, holders or tax_holders");
+        ctx("seller.near", 1_000);
+        assert_eq!(panics(|| fp(&mut f, "creator", "near", 5_000)), "kind: token or quote");
+        ctx("seller.near", 1_000);
+        assert_eq!(panics(|| fp(&mut f, "creator", "token", 10_001)), "sold is more than the seller holds for this launch");
+        ctx("seller.near", 1_000);
+        assert_eq!(panics(|| fp(&mut f, "protocol", "token", 5_000)), "sold is more than the seller holds for this launch");
+        ctx("seller.near", 449);
+        assert_eq!(panics(|| fp(&mut f, "creator", "token", 5_000)), "proceeds below the keeper's floor for what was sold");
+        ctx("seller.near", 450);
+        assert_eq!(panics(|| drop(f.tax_proceeds(U64(c), U128(5_000)))), "sold is more than the seller holds for this launch");
+        ctx("seller.near", 450);
+        fp(&mut f, "creator", "token", 5_000);
+
+        let back = |share: &str| format!(r#"{{"fee_return":{},"share":"{}"}}"#, c, share);
+        ctx(tc.as_str(), 0);
+        assert!(matches!(f.ft_on_transfer(acct("bob.near"), U128(5_000), back("creator")), PromiseOrValue::Value(U128(5_000))), "a stranger is refunded");
+        for share in ["protocol", "holders", "tax_holders", "dev"] {
+            ctx(tc.as_str(), 0);
+            assert!(matches!(f.ft_on_transfer(acct("seller.near"), U128(5_000), back(share)), PromiseOrValue::Value(U128(5_000))), "{share} holds none of it");
+        }
+        ctx("usdc.near", 0);
+        assert!(matches!(f.ft_on_transfer(acct("seller.near"), U128(5_000), back("creator")), PromiseOrValue::Value(U128(5_000))), "not this launch's token or pair");
+        ctx(tc.as_str(), 0);
+        assert!(matches!(f.ft_on_transfer(acct("seller.near"), U128(5_000), back("creator")), PromiseOrValue::Value(U128(0))));
+        let fs = f.get_fee_selling(U64(c));
+        assert_eq!((l(&f, c).creator_token_fees.0, fs.creator_token_selling.0, fs.creator_token_floor.0), (5_000, 0, 0));
+        assert!(logs_with("fees_returned")[0].contains(r#""floor_dropped":"450""#));
+
+        keeper();
+        drop(f.push_creator_token_fees(U64(c), Some(U128(300)), None, None));
+        ctx(ME, 0);
+        assert!(!f.on_fees_to_seller(U64(c), "creator".into(), "token".into(), U128(5_000), U128(300), Err(PromiseError::Failed)));
+        let fs = f.get_fee_selling(U64(c));
+        assert_eq!((l(&f, c).creator_token_fees.0, fs.creator_token_selling.0, fs.creator_token_floor.0), (5_000, 0, 0));
+
+        let u = launch_paid(&mut f, "FRU", Some(usdc.clone()), Some("holders"), None, Some("near"));
+        book(&mut f, u, 0, 0, 0, 8_000);
+        add_counter(&holders_pending_key(u, "holders"), 700);
+        keeper();
+        f.split_protocol_quote_fees(U64(u), Some(U128(800)), None);
+        keeper();
+        f.pay_holders_t(U64(u), vec![], Some(U128(60)), None);
+        to_seller(&mut f, u, "protocol", "quote", 8_000, 800);
+        ctx(ME, 0);
+        assert!(!f.on_fees_to_seller(U64(u), "holders".into(), "quote".into(), U128(700), U128(60), Err(PromiseError::Failed)));
+        assert_eq!(f.get_fee_selling(U64(u)).holders_pending.0, 700, "the holders' failed slice waits again");
+        ctx("usdc.near", 0);
+        let backu = format!(r#"{{"fee_return":{},"share":"protocol"}}"#, u);
+        assert!(matches!(f.ft_on_transfer(acct("seller.near"), U128(8_000), backu), PromiseOrValue::Value(U128(0))));
+        let fs = f.get_fee_selling(U64(u));
+        assert_eq!((l(&f, u).protocol_quote_fees.0, fs.protocol_quote_selling.0, fs.protocol_quote_floor.0), (8_000, 0, 0));
+
+        let tu = l(&f, u).token.clone();
+        ctx(tu.as_str(), 0);
+        assert!(matches!(f.ft_on_transfer(acct("seller.near"), U128(1), format!(r#"{{"fee_return":{},"share":"holders"}}"#, u)), PromiseOrValue::Value(U128(1))));
+
+        ctx("alice.near", f.quote_launch(0, None, Some(false)).total.0);
+        assert_eq!(panics(|| drop(f.launch(LaunchArgs { creator_paid_in: Some("tokens".into()), ..args("BADC") }))), "creator_paid_in: near or pair");
+        ctx("alice.near", f.quote_launch(0, None, Some(false)).total.0);
+        assert_eq!(panics(|| drop(f.launch(LaunchArgs { holders_paid_in: Some("usd".into()), ..args("BADH") }))), "holders_paid_in: near or pair");
+
+        keeper();
+        f.set_paused(true);
+        keeper();
+        assert_eq!(panics(|| drop(f.push_creator_token_fees(U64(c), Some(U128(300)), None, None))), "paused");
+        ctx("seller.near", 1);
+        assert_eq!(panics(|| fp(&mut f, "creator", "token", 1)), "paused");
+    }
+
     #[test]
     fn a_lock_expires_and_only_its_owner_releases_it() {
         let _f = factory();
@@ -6111,8 +6951,8 @@ mod v6_tests {
         f.launches.insert(id, lz);
         ctx("owner.near", 0);
         f.set_house_creators(vec![acct("alice.near")], true);
-        ctx("anyone.near", 0);
-        f.split_protocol_token_fees(U64(id));
+        ctx("owner.near", 0);
+        f.split_protocol_token_fees(U64(id), None, None);
         let lz = l(&f, id);
         assert_eq!((lz.creator_token_fees.0, lz.protocol_token_fees.0), (700, 0));
         assert!(logs_with("protocol_token_fees_split")[0].contains(r#""amount":"300""#));
@@ -6127,14 +6967,14 @@ mod v6_tests {
         park(&mut f, id, Step::Done);
         set_mode_bucket(id, 1_000);
         ctx("owner.near", 0);
-        assert_eq!(panics(|| f.pay_holders(U64(id), vec![(acct("a.near"), U128(10)), (acct("b.near"), U128(10)), (acct("a.near"), U128(10))])), "duplicate account in payouts");
+        assert_eq!(panics(|| f.pay_holders_t(U64(id), vec![(acct("a.near"), U128(10)), (acct("b.near"), U128(10)), (acct("a.near"), U128(10))], None, None)), "duplicate account in payouts");
         ctx("owner.near", 0);
-        f.pay_holders(U64(id), vec![(acct("a.near"), U128(10)), (acct("b.near"), U128(10))]);
+        f.pay_holders_t(U64(id), vec![(acct("a.near"), U128(10)), (acct("b.near"), U128(10))], None, None);
         assert_eq!(mode_bucket(id), 980);
         let tid = live_tax_launch(&mut f, "THOLD", None, 0);
         add_counter(&tax_holders_key(tid), 1_000);
         ctx("owner.near", 0);
-        assert_eq!(panics(|| f.pay_tax_holders(U64(tid), vec![(acct("a.near"), U128(1)), (acct("a.near"), U128(1))])), "duplicate account in payouts");
+        assert_eq!(panics(|| f.pay_tax_holders_t(U64(tid), vec![(acct("a.near"), U128(1)), (acct("a.near"), U128(1))], None, None)), "duplicate account in payouts");
         let bid = live_burn_launch(&mut f, "FLOOR0", 10u128.pow(24));
         ctx("owner.near", 0);
         assert_eq!(panics(|| drop(f.buyback(U64(bid), U128(0)))), "min_out required");
@@ -6148,7 +6988,7 @@ mod v6_tests {
         let tid = live_tax_launch(&mut f, "OWED", None, 0);
         add_counter(&tax_holders_key(tid), 1_000);
         ctx("owner.near", 0);
-        f.pay_tax_holders(U64(tid), vec![(acct("a.near"), U128(300)), (acct("gone.near"), U128(200))]);
+        f.pay_tax_holders_t(U64(tid), vec![(acct("a.near"), U128(300)), (acct("gone.near"), U128(200))], None, None);
         assert_eq!((read_counter(&tax_holders_key(tid)), read_counter(&tax_paid_holders_key(tid))), (500, 500));
 
         ctx_results(vec![near_sdk::PromiseResult::Failed]);
@@ -6162,7 +7002,7 @@ mod v6_tests {
         park(&mut f, hid, Step::Done);
         set_mode_bucket(hid, 100);
         ctx("owner.near", 0);
-        f.pay_holders(U64(hid), vec![(acct("gone.near"), U128(40))]);
+        f.pay_holders_t(U64(hid), vec![(acct("gone.near"), U128(40))], None, None);
         ctx_results(vec![near_sdk::PromiseResult::Failed]);
         f.on_paid(U64(hid), "near".into(), acct("gone.near"), U128(40), "mode".into(), false);
         assert_eq!((mode_bucket(hid), f.get_owed("near".into(), acct("gone.near")).0), (60, 240));
@@ -6200,7 +7040,7 @@ mod v6_tests {
         let tid = live_tax_launch(&mut f, "OWEDQ", Some(usdc.clone()), 0);
         add_counter(&tax_holders_key(tid), 1_000);
         ctx("owner.near", 0);
-        f.pay_tax_holders(U64(tid), vec![(acct("b.near"), U128(70))]);
+        f.pay_tax_holders_t(U64(tid), vec![(acct("b.near"), U128(70))], None, None);
         ctx_results(vec![near_sdk::PromiseResult::Failed]);
         f.on_paid(U64(tid), "quote".into(), acct("b.near"), U128(70), "tax_holders".into(), false);
         assert_eq!((f.get_owed("usdc.near".into(), acct("b.near")).0, f.get_owed("near".into(), acct("b.near")).0), (70, 0));
@@ -6249,14 +7089,14 @@ mod v6_tests {
             ("collect_tax", Box::new(move |f: &mut Factory| drop(f.collect_tax(U64(tid))))),
             ("process_tax", Box::new(move |f: &mut Factory| drop(f.process_tax(U64(tid), U128(1), None, None)))),
             ("buyback", Box::new(move |f: &mut Factory| drop(f.buyback(U64(bid), U128(1))))),
-            ("pay_holders", Box::new(move |f: &mut Factory| f.pay_holders(U64(bid), vec![(acct("a.near"), U128(1))]))),
-            ("pay_tax_holders", Box::new(move |f: &mut Factory| f.pay_tax_holders(U64(tid), vec![(acct("a.near"), U128(1))]))),
+            ("pay_holders", Box::new(move |f: &mut Factory| f.pay_holders_t(U64(bid), vec![(acct("a.near"), U128(1))], None, None))),
+            ("pay_tax_holders", Box::new(move |f: &mut Factory| f.pay_tax_holders_t(U64(tid), vec![(acct("a.near"), U128(1))], None, None))),
             ("tax_proceeds", Box::new(move |f: &mut Factory| { f.tax_proceeds(U64(tid), U128(1)); })),
             ("push_creator_fees", Box::new(|f: &mut Factory| drop(f.push_creator_fees(acct("alice.near"))))),
-            ("push_creator_token_fees", Box::new(move |f: &mut Factory| drop(f.push_creator_token_fees(U64(id))))),
-            ("push_creator_quote_fees", Box::new(move |f: &mut Factory| drop(f.push_creator_quote_fees(U64(id))))),
-            ("split_protocol_token_fees", Box::new(move |f: &mut Factory| f.split_protocol_token_fees(U64(id)))),
-            ("split_protocol_quote_fees", Box::new(move |f: &mut Factory| f.split_protocol_quote_fees(U64(id)))),
+            ("push_creator_token_fees", Box::new(move |f: &mut Factory| drop(f.push_creator_token_fees(U64(id), None, None, None)))),
+            ("push_creator_quote_fees", Box::new(move |f: &mut Factory| drop(f.push_creator_quote_fees(U64(id), None, None, None)))),
+            ("split_protocol_token_fees", Box::new(move |f: &mut Factory| f.split_protocol_token_fees(U64(id), None, None))),
+            ("split_protocol_quote_fees", Box::new(move |f: &mut Factory| f.split_protocol_quote_fees(U64(id), None, None))),
             ("burn_token_fees", Box::new(move |f: &mut Factory| drop(f.burn_token_fees(U64(bid))))),
             ("push_owed", Box::new(|f: &mut Factory| f.push_owed("near".into(), vec![acct("a.near")]))),
         ];
@@ -6267,8 +7107,6 @@ mod v6_tests {
 
         ctx("alice.near", 0);
         drop(f.claim_creator_fees());
-        ctx("alice.near", 0);
-        drop(f.claim_creator_token_fees(U64(id)));
         ctx("owner.near", 0);
         drop(f.withdraw_protocol_fees(acct("owner.near"), None));
         ctx("owner.near", 0);
@@ -6320,15 +7158,15 @@ mod v6_tests {
         assert_eq!(f.get_creator_fees(acct("alice.near")).0, 15);
         assert_eq!(logs_with("creator_push_failed").len(), 1);
 
-        ctx("alice.near", 0);
-        drop(f.claim_creator_token_fees(U64(id)));
+        ctx("owner.near", 0);
+        drop(f.push_creator_token_fees(U64(id), None, None, Some(true)));
         assert!(callback_names().contains(&"on_paid".to_string()));
         bounce(&mut f, id, "token", "alice.near", 11, "creator");
         assert_eq!(l(&f, id).creator_token_fees.0, 11);
         assert_eq!(logs_with("creator_token_push_failed").len(), 1);
 
-        ctx("alice.near", 0);
-        drop(f.claim_creator_quote_fees(U64(qid)));
+        ctx("owner.near", 0);
+        drop(f.push_creator_quote_fees(U64(qid), None, None, Some(true)));
         bounce(&mut f, qid, "quote", "alice.near", 13, "creator");
         assert_eq!(l(&f, qid).creator_quote_fees.0, 13);
         assert!(logs_with("quote_push_failed")[0].contains(r#""protocol":false"#));
@@ -6831,8 +7669,8 @@ mod v6_tests {
         let mut lz = l(&f, id);
         lz.creator_token_fees = U128(1_000);
         f.launches.insert(id, lz);
-        ctx("anyone.near", 0);
-        drop(f.push_creator_token_fees(U64(id)));
+        ctx("owner.near", 0);
+        drop(f.push_creator_token_fees(U64(id), None, None, Some(true)));
 
         assert!(calls().iter().all(|c| c.1 != "ft_transfer_call"), "no transfer call to a router");
         let ft = calls().into_iter().find(|c| c.1 == "ft_transfer").expect("ft_transfer");
@@ -7008,13 +7846,19 @@ mod v6_tests {
             transfers_key(&a), locker_add_gas_key(&a), dcl_registered_key(&a), unwrap_pending_key(1), locker_add_buy_key(&a), dev_buy_done_key(1), buy_held_key(1), buy_refund_inflight_key(1), no_add_key(1), owed_key("near", &a), owed_total_key("near"), UW_TOTAL_KEY.to_vec(),
 
             dev_unwrap_op_key(1),
+
+            creator_in_pair_key(1), holders_in_near_key(1), holders_pending_key(1, "holders"), holders_pending_key(1, "tax_holders"),
+            selling_key(1, "creator", "token"), sell_floor_key(1, "creator", "token"), selling_key(1, "creator", "quote"), sell_floor_key(1, "creator", "quote"),
+            selling_key(1, "protocol", "token"), sell_floor_key(1, "protocol", "token"), selling_key(1, "protocol", "quote"), sell_floor_key(1, "protocol", "quote"),
+            selling_key(1, "holders", "quote"), sell_floor_key(1, "holders", "quote"), selling_key(1, "tax_holders", "quote"), sell_floor_key(1, "tax_holders", "quote"),
+            holders_near_key(1, "holders"), holders_near_key(1, "tax_holders"), LOCKER_RESERVE_KEY.to_vec(), LOCKER_N_KEY.to_vec(), FEE_SLICES_OUT_KEY.to_vec(),
         ];
         let prefixes: Vec<&[u8]> = keys.iter().map(|k| &k[..3]).collect();
         for (i, p) in prefixes.iter().enumerate() {
             assert!(!prefixes[..i].contains(p), "prefix {:?} used twice", String::from_utf8_lossy(p));
             assert!(p[0] >= 0x06 && p[0] != b'S' && p[0] != b'L', "prefix {:?} can meet a map or the state", String::from_utf8_lossy(p));
         }
-        assert_eq!(prefixes.len(), 48);
+        assert_eq!(prefixes.len(), 69);
     }
 
 
@@ -7198,8 +8042,8 @@ mod v6_tests {
         lz.creator_token_fees = U128(1_000);
         f.launches.insert(id, lz);
         let token = l(&f, id).token.clone();
-        ctx("anyone.near", 0);
-        drop(f.push_creator_token_fees(U64(id)));
+        ctx("owner.near", 0);
+        drop(f.push_creator_token_fees(U64(id), None, None, Some(true)));
         assert!(!transfers_pending(&token));
     }
 
@@ -7604,12 +8448,12 @@ mod v6_tests {
 
         ctx(ME, 0);
         take_swap_lock(&pair, LOCKER_WITHDRAW_LOCK_ID, LK_ADMIN);
-        ctx("anyone.near", 0);
-        assert_eq!(panics(|| drop(f.push_creator_quote_fees(U64(id)))), "swap in flight");
+        ctx("owner.near", 0);
+        assert_eq!(panics(|| drop(f.push_creator_quote_fees(U64(id), None, None, Some(true)))), "swap in flight");
         ctx(ME, 0);
         release_swap_lock(&pair, LOCKER_WITHDRAW_LOCK_ID, LK_ADMIN);
-        ctx("anyone.near", 0);
-        drop(f.push_creator_quote_fees(U64(id)));
+        ctx("owner.near", 0);
+        drop(f.push_creator_quote_fees(U64(id), None, None, Some(true)));
         assert_eq!(l(&f, id).creator_quote_fees.0, 0);
     }
 
@@ -8482,8 +9326,8 @@ mod v6_tests {
         owner(); f.set_house_creators(vec![acct("alice.near")], true);
         owner();
         assert_eq!(panics(|| f.set_house_buyback(U64(id))), "pay the creator's booked token and quote fees first");
-        ctx("anyone.near", 0);
-        drop(f.push_creator_token_fees(U64(id)));
+        owner();
+        drop(f.push_creator_token_fees(U64(id), None, None, Some(true)));
         owner(); f.set_house_buyback(U64(id));
         assert_eq!(f.get_fee_opts(U64(id)).mode, "burn");
     }
