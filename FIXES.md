@@ -215,3 +215,14 @@ Every proposal above stayed in progress after its first and second approvals and
 
 The keepers ran after each change with no failed calls.
 
+## Follow-up (2026-10-19): fees in NEAR, the 60 / 20 / 10 / 10 split, exact launch pricing
+
+The owner DAO upgraded the factory to `8260ddd1cd0366577f4bd7717a42f9a602707776ea74e6a49f66004a78170496` (`9mwfrbtBbDr3y2t9rHY944qAQTU2PsB5smqsAHZJo4G5`, commit `e82bfa0`, cargo-near reproducible) with proposal #17, executed in tx `2uraygxPDLGtiuY9rHhHGWx2AKG1KNWYCNDnNzk1dfTc` on 2026-10-19 at 22:29 UTC. The wasm was stored on the DAO in tx `44EHEmRfFR4FnZwtecXXBWzTDnaW239gBkw5gstYA6v9` and removed after the upgrade. Proposal #15 carried the same bytes; its executing vote attached 100 TGas, the upgrade ran out of gas and the factory stayed unchanged, so the same build was proposed again as #17 and executed by a vote with 300 TGas. Proposal #16 added `batman-4.nearlytrade.near` as a launch pair (`set_quote`, `register_quote`).
+
+| Commit | Change |
+|---|---|
+| `d4804bc` | Fees in NEAR. The protocol is paid in NEAR on every pair. A creator is never paid the launch token: NEAR, or the pair token if chosen at launch (`creator_paid_in`). Holders are paid in the pair token or NEAR as chosen at launch (`holders_paid_in`). A keeper hands one slice of a fee pile at a time to the tax seller with a price floor; the seller reports what it got with `fee_proceeds`. New view `get_fee_selling`. |
+| `122115b` | New launches split pool fees and the tax platform cut 60 creator / 20 protocol / 10 referral pot / 10 NEARLY holders pot. The retired burn pot is replaced by the holders pot (`set_holders_pot`, `get_holders_pot`, `holderspot.near`). Launches without a stored creator share keep 70%. `migrate` sets the 60% share and the holders pot in the upgrade itself. Launches made earlier keep the split they were created with. |
+| `e82bfa0` | Exact launch pricing. The token is funded with what it stores (a measured base, the JSON-escaped icon and name, a fixed extra for a tax, no percentage margin). The launch record is charged for its own bytes (`record_storage` in `quote_launch`). `create_pool` is charged at what Rhea keeps while the factory fronts the full attach, or the full attach when its free balance is below 2 NEAR. `quote_launch` takes the text size. Launches in flight across the upgrade keep their earlier refunds. |
+
+Tests: 166 pass (`cargo test -p nearpad-factory`). The exact bytes were rehearsed on testnet from the mainnet code: every view of every existing launch unchanged across the upgrade, new launches split 60 / 20 / 10 / 10 with the holders pot paid in NEAR, every launch shape completed at exactly its quote with the token still funded after trades, rollback and upgrade again identical.
