@@ -18,7 +18,16 @@ const TOKEN_DECIMALS: u8 = 18;
 const NEAR_DECIMALS: u8 = 24;
 const STORAGE_PRICE_PER_BYTE: u128 = 10_000_000_000_000_000_000;
 
-const TOKEN_BASE_STORAGE_BYTES: u128 = 3_000;
+
+const TOKEN_BASE_STORAGE_BYTES: u128 = 1_000;
+
+
+
+const RECORD_BASE_BYTES: u128 = 1_500;
+
+const MAX_LINKS_BYTES: usize = 3 * 200;
+
+const MAX_TOKEN_TEXT_BYTES: usize = 32 * 4 + 12;
 
 
 
@@ -41,6 +50,12 @@ const FT_STORAGE_REG: NearToken = NearToken::from_yoctonear(1_250_000_000_000_00
 const DCL_REGISTER: NearToken = NearToken::from_millinear(500);
 
 const DCL_POOL_CREATE: NearToken = NearToken::from_millinear(100);
+
+
+
+const DCL_POOL_CHARGE: NearToken = NearToken::from_millinear(14);
+
+const POOL_FLOAT_MIN: NearToken = NearToken::from_near(2);
 const ONE_YOCTO: NearToken = NearToken::from_yoctonear(1);
 const NO_DEPOSIT: NearToken = NearToken::from_yoctonear(0);
 
@@ -551,6 +566,8 @@ pub struct FeeSelling {
 pub struct LaunchCost {
     pub launch_fee: U128,
     pub token_storage: U128,
+
+    pub record_storage: U128,
     pub pool_create: U128,
     pub dcl_storage: U128,
     pub dev_buy: U128,
@@ -863,7 +880,10 @@ impl Factory {
         } else {
             mul_div(dev_buy_tokens_out(init_x + POINT_DELTA_1PCT, self.config.total_supply.0, dev_buy, self.config.pool_fee), DEV_BUY_MIN_OUT_BPS, BPS)
         };
-        let cost = self.internal_cost(icon_len, name.len() + symbol.len() + description.len(), dev_buy, tax.is_some());
+        let links_len = [&links.website, &links.twitter, &links.telegram].into_iter().flatten().map(|l| l.len()).sum::<usize>();
+        let fronted = self.pool_fronted();
+        let icon_stored = args.icon.as_ref().map(|i| json_len(i)).unwrap_or(0);
+        let cost = self.internal_cost(icon_stored, json_len(&name) + symbol.len(), name.len() + symbol.len() + description.len() + links_len, dev_buy, tax.is_some(), fronted);
         require!(deposit >= cost.total.0, "attached deposit below quote_launch(...).total");
 
 
@@ -875,6 +895,9 @@ impl Factory {
         }
         let id = self.next_id;
         self.next_id += 1;
+        if !fronted {
+            env::storage_write(&pool_full_key(id), &[1]);
+        }
         if !self.symbol_index.contains_key(&slug) {
             self.symbol_index.insert(slug.clone(), id);
         }
@@ -1007,7 +1030,8 @@ impl Factory {
             require!(gas_left() >= GAS_ADD_BUY_STEP.saturating_add(GAS_ADD_BUY_MARGIN), "attach at least 260 TGas: this launch's first buy goes out with its position");
         }
         let icon_len = icon_len_of(launch_id.0, &l);
-        let storage = self.internal_cost(icon_len, l.name.len() + l.symbol.len() + l.description.len(), 0, tax_opts(launch_id.0).is_some()).token_storage.0;
+        let icon_stored = l.icon.as_ref().map(|i| json_len(i)).unwrap_or(icon_len);
+        let storage = self.token_storage_of(icon_stored, json_len(&l.name) + l.symbol.len(), tax_opts(launch_id.0).is_some());
         self.internal_run_step(launch_id.0, l, storage, false)
     }
 
@@ -1110,10 +1134,18 @@ impl Factory {
 
             if inline {
                 let icon_len = icon_len_of(id, &l);
-                let storage = self.internal_cost(icon_len, l.name.len() + l.symbol.len() + l.description.len(), 0, tax_opts(id).is_some()).token_storage.0;
+                let icon_stored = l.icon.as_ref().map(|i| json_len(i)).unwrap_or(icon_len);
+
+                let storage = if id < exact_from() {
+                    legacy_token_storage(icon_len, l.name.len() + l.symbol.len() + l.description.len(), tax_opts(id).is_some())
+                } else {
+                    self.token_storage_of(icon_stored, json_len(&l.name) + l.symbol.len(), tax_opts(id).is_some())
+                };
                 emit("token_storage_refunded", &format!(r#"{{"id":{},"creator":"{}","amount":"{}"}}"#, id, l.creator, storage));
                 self.internal_refund_creator(id, &l.creator, storage).detach();
             }
+
+            l.icon = None;
             return self.internal_fail(id, l, "token create");
         }
 
@@ -1175,7 +1207,8 @@ impl Factory {
             Ok(Some(_)) => {
 
 
-                let fee = DCL_POOL_CREATE.as_yoctonear();
+                let full = env::storage_has_key(&pool_full_key(id)) || id < exact_from();
+                let fee = if full { DCL_POOL_CREATE } else { DCL_POOL_CHARGE }.as_yoctonear();
                 emit("pool_deposit_refunded", &format!(r#"{{"id":{},"creator":"{}","amount":"{}"}}"#, id, l.creator, fee));
                 self.internal_refund_creator(id, &l.creator.clone(), fee).detach();
                 self.internal_mark_failed(id, l, "pool exists at another price")
@@ -2821,8 +2854,11 @@ impl Factory {
     }
 
 
-    pub fn quote_launch(&self, icon_bytes: u32, dev_buy: Option<U128>, tax: Option<bool>) -> LaunchCost {
-        self.internal_cost(icon_bytes as usize, MAX_TEXT_BYTES, dev_buy.map(|d| d.0).unwrap_or(0), tax.unwrap_or(false))
+
+
+    pub fn quote_launch(&self, icon_bytes: u32, dev_buy: Option<U128>, tax: Option<bool>, text_bytes: Option<u32>) -> LaunchCost {
+        let record_text = text_bytes.map(|t| (t as usize).min(MAX_TEXT_BYTES + MAX_LINKS_BYTES)).unwrap_or(MAX_TEXT_BYTES + MAX_LINKS_BYTES);
+        self.internal_cost(icon_bytes as usize, MAX_TOKEN_TEXT_BYTES, record_text, dev_buy.map(|d| d.0).unwrap_or(0), tax.unwrap_or(false), self.pool_fronted())
     }
 
     pub fn get_config(&self) -> Config {
@@ -3365,6 +3401,10 @@ impl Factory {
         if self.config.creator_fee_share_bps != MIN_CREATOR_SHARE_BPS {
             self.config.creator_fee_share_bps = MIN_CREATOR_SHARE_BPS;
             emit("creator_share_set", &format!(r#"{{"creator_share_bps":{}}}"#, MIN_CREATOR_SHARE_BPS));
+        }
+        if env::storage_read(EXACT_FROM_KEY).is_none() {
+            env::storage_write(EXACT_FROM_KEY, &self.next_id.to_le_bytes());
+            emit("exact_pricing_from", &format!(r#"{{"id":{}}}"#, self.next_id));
         }
         if holders_pot().is_none() {
             let pot: AccountId = NEARLY_HOLDERS_POT.parse().unwrap();
@@ -4183,19 +4223,37 @@ impl Factory {
             .then(Self::ext(env::current_account_id()).with_static_gas(GAS_ON_SPLIT).on_fee_burned(launch_id, U128(amount)))
     }
 
-    fn internal_cost(&self, icon_len: usize, text_len: usize, dev_buy: u128, tax: bool) -> LaunchCost {
-        let bytes = TOKEN_BASE_STORAGE_BYTES + icon_len as u128 + text_len as u128 + if tax { TAX_EXTRA_BYTES } else { 0 };
-        let token_storage = bytes * STORAGE_PRICE_PER_BYTE * 125 / 100 + FT_STORAGE_REG.as_yoctonear();
+
+
+    fn internal_cost(&self, icon_len: usize, token_text: usize, record_text: usize, dev_buy: u128, tax: bool, fronted: bool) -> LaunchCost {
+        let token_storage = self.token_storage_of(icon_len, token_text, tax);
+        let record_storage = (RECORD_BASE_BYTES + record_text as u128) * STORAGE_PRICE_PER_BYTE;
+        let pool_create = if fronted { DCL_POOL_CHARGE } else { DCL_POOL_CREATE }.as_yoctonear();
         let dcl_storage = self.dcl_storage(self.next_id);
         let dev = dev_buy;
         LaunchCost {
             launch_fee: self.config.launch_fee,
             token_storage: U128(token_storage),
-            pool_create: U128(DCL_POOL_CREATE.as_yoctonear()),
+            record_storage: U128(record_storage),
+            pool_create: U128(pool_create),
             dcl_storage: U128(dcl_storage),
             dev_buy: U128(dev),
-            total: U128(self.config.launch_fee.0 + token_storage + DCL_POOL_CREATE.as_yoctonear() + dcl_storage + dev),
+            total: U128(self.config.launch_fee.0 + token_storage + record_storage + pool_create + dcl_storage + dev),
         }
+    }
+
+
+    fn token_storage_of(&self, icon_len: usize, token_text: usize, tax: bool) -> u128 {
+        let bytes = TOKEN_BASE_STORAGE_BYTES + icon_len as u128 + token_text as u128 + if tax { TAX_EXTRA_BYTES } else { 0 };
+        bytes * STORAGE_PRICE_PER_BYTE + FT_STORAGE_REG.as_yoctonear()
+    }
+
+
+    fn pool_fronted(&self) -> bool {
+        let locked = env::storage_usage() as u128 * STORAGE_PRICE_PER_BYTE;
+
+        let own = env::account_balance().as_yoctonear().saturating_sub(env::attached_deposit().as_yoctonear());
+        own.saturating_sub(locked) >= POOL_FLOAT_MIN.as_yoctonear()
     }
 
     fn internal_fail(&mut self, id: u64, mut l: Launch, step: &str) -> PromiseOrValue<bool> {
@@ -4934,7 +4992,7 @@ mod tests {
             None,
         );
         let requested = 60 * 10u128.pow(24);
-        let deposit = f.quote_launch(0, Some(U128(requested)), None).total.0;
+        let deposit = f.quote_launch(0, Some(U128(requested)), None, None).total.0;
         near_sdk::testing_env!(VMContextBuilder::new()
             .current_account_id("nearlytrade.near".parse().unwrap())
             .predecessor_account_id(creator.clone())
@@ -4951,7 +5009,7 @@ mod tests {
         let l = f.launches.get(&0).cloned().unwrap();
         let held = l.dev_buy_held.0;
         assert!(l.dev_buy_exact && held < requested, "60 NEAR is over the 4% cap");
-        let cost = f.internal_cost(0, "Doomslug".len() + "DOOM".len(), held, false).total.0;
+        let cost = f.internal_cost(0, 12, 12, held, false, f.pool_fronted()).total.0;
         let refunds: Vec<u128> = get_created_receipts().iter()
             .filter(|r| r.receiver_id == creator)
             .flat_map(|r| r.actions.iter())
@@ -4996,7 +5054,7 @@ mod fee_to_tests {
         }
     }
     fn launch(f: &mut Factory, who: &str, sym: &str, fee_to: Option<&str>) -> u64 {
-        let deposit = f.quote_launch(0, None, None).total.0;
+        let deposit = f.quote_launch(0, None, None, None).total.0;
         as_caller(f, who, deposit);
         std::mem::forget(f.launch(args(sym, fee_to)));
         f.next_id - 1
@@ -5244,6 +5302,21 @@ fn dev_unwrap_op_key(id: u64) -> Vec<u8> { [b"uf:".as_slice(), &id.to_le_bytes()
 
 
 fn icon_len_key(id: u64) -> Vec<u8> { [b"il:".as_slice(), &id.to_le_bytes()].concat() }
+
+fn pool_full_key(id: u64) -> Vec<u8> { [b"pf:".as_slice(), &id.to_le_bytes()].concat() }
+
+
+const EXACT_FROM_KEY: &[u8] = b"xpf";
+fn exact_from() -> u64 { env::storage_read(EXACT_FROM_KEY).map(|b| u64::from_le_bytes(b.try_into().expect("exact from"))).unwrap_or(0) }
+
+
+fn json_len(s: &str) -> usize {
+    s.len() + s.chars().map(|c| match c { '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 1, c if (c as u32) < 0x20 => 5, _ => 0 }).sum::<usize>()
+}
+
+fn legacy_token_storage(icon_len: usize, text_len: usize, tax: bool) -> u128 {
+    (3_000 + icon_len as u128 + text_len as u128 + if tax { 600 } else { 0 }) * STORAGE_PRICE_PER_BYTE * 125 / 100 + FT_STORAGE_REG.as_yoctonear()
+}
 fn icon_len_of(id: u64, l: &Launch) -> usize {
     l.icon.as_ref().map(|s| s.len()).unwrap_or_else(|| read_counter(&icon_len_key(id)) as usize)
 }
@@ -5440,7 +5513,7 @@ mod v6_tests {
     }
     pub(super) fn launch_with(f: &mut Factory, who: &str, a: LaunchArgs) -> u64 {
         let icon_len = a.icon.as_ref().map(|s| s.len()).unwrap_or(0) as u32;
-        let deposit = f.quote_launch(icon_len, a.dev_buy, Some(a.tax.is_some())).total.0;
+        let deposit = f.quote_launch(icon_len, a.dev_buy, Some(a.tax.is_some()), None).total.0;
         ctx(who, deposit);
         std::mem::forget(f.launch(a));
         f.next_id - 1
@@ -5723,7 +5796,7 @@ mod v6_tests {
 
 
 
-    fn created_but_pool_refused(f: &mut Factory, near: u128) -> u64 {
+    pub(super) fn created_but_pool_refused(f: &mut Factory, near: u128) -> u64 {
         let id = launch_with(f, "alice.near", LaunchArgs { dev_buy: Some(U128(near)), ..args("GRIEF") });
         ctx(ME, 0);
         let r = f.on_created(id, None, Ok(StorageBalanceJson { total: "0".into() }), Err(PromiseError::Failed));
@@ -5766,10 +5839,37 @@ mod v6_tests {
         let lz = l(&f, id);
         assert_eq!((lz.step, lz.inflight, lz.dev_buy_held.0), (Step::Failed, false, near));
 
-        assert_eq!(transfers(), vec![("alice.near".to_string(), DCL_POOL_CREATE.as_yoctonear())]);
+        assert_eq!(transfers(), vec![("alice.near".to_string(), DCL_POOL_CHARGE.as_yoctonear())]);
         ctx("anyone.near", 0);
         drop(f.refund_failed(U64(id)));
         assert_eq!(transfers(), vec![("alice.near".to_string(), near)]);
+
+        let id2 = created_but_pool_refused(&mut f, near);
+        env::storage_write(&pool_full_key(id2), &[1]);
+        let point = l(&f, id2).init_point;
+        ctx(ME, 0);
+        drop(f.on_pool_checked(id2, None, Ok(Some(near_sdk::serde_json::json!({"current_point": point + 200})))));
+        assert_eq!(transfers(), vec![("alice.near".to_string(), DCL_POOL_CREATE.as_yoctonear())]);
+    }
+
+    #[test]
+    fn a_low_float_charges_the_full_create_pool_and_remembers_it() {
+        let mut f = factory();
+
+        let mut c = near_sdk::test_utils::VMContextBuilder::new();
+        c.current_account_id(acct(ME)).predecessor_account_id(acct("alice.near")).account_balance(NearToken::from_millinear(500));
+        near_sdk::testing_env!(c.build());
+        assert!(!f.pool_fronted());
+        assert_eq!(f.quote_launch(0, None, None, None).pool_create.0, DCL_POOL_CREATE.as_yoctonear());
+        let q = f.quote_launch(0, None, None, None).total.0;
+        c.attached_deposit(NearToken::from_yoctonear(q)).account_balance(NearToken::from_yoctonear(q + NearToken::from_millinear(500).as_yoctonear()));
+        near_sdk::testing_env!(c.build());
+        std::mem::forget(f.launch(args("LOWF")));
+        let id = f.next_id - 1;
+        assert!(env::storage_has_key(&pool_full_key(id)), "remembered for a refused create_pool");
+
+        let id2 = launch(&mut f, "bob.near", "HIGHF");
+        assert!(!env::storage_has_key(&pool_full_key(id2)));
     }
 
     #[test]
@@ -5919,7 +6019,7 @@ mod v6_tests {
     }
     fn launch_scheduled(f: &mut Factory, who: &str, a: LaunchArgs) -> u64 {
         let icon_len = a.icon.as_ref().map(|s| s.len()).unwrap_or(0) as u32;
-        let deposit = f.quote_launch(icon_len, a.dev_buy, Some(a.tax.is_some())).total.0;
+        let deposit = f.quote_launch(icon_len, a.dev_buy, Some(a.tax.is_some()), None).total.0;
         ctx(who, deposit);
         drop(f.launch(a));
         f.next_id - 1
@@ -5971,7 +6071,7 @@ mod v6_tests {
         let id2 = launch_scheduled(&mut f, "alice.near", args("ONEPOT"));
         assert_eq!(f.get_launch_recipients(U64(id2)).unwrap(), vec![(acct("p1.near"), 3750), (acct("p2.near"), 3750), (acct("holders.near"), 2500)]);
 
-        ctx("bob.near", f.quote_launch(0, None, None).total.0);
+        ctx("bob.near", f.quote_launch(0, None, None, None).total.0);
         assert_eq!(panics(|| drop(f.launch(LaunchArgs { creator_share_bps: Some(8000), ..args("PICK") }))), "creator_share_bps: the launchpad's current share, or leave it out");
 
         owner();
@@ -6010,7 +6110,7 @@ mod v6_tests {
         let mut f = factory();
         let id = launch_scheduled(&mut f, "alice.near", args("REG"));
         let token = l(&f, id).token.to_string();
-        let storage = f.internal_cost(0, "REG".len() * 2, 0, false).token_storage.0;
+        let storage = f.token_storage_of(0, "REG".len() * 2, false);
         let to_token: u128 = transfers().into_iter().filter(|t| t.0 == token).map(|t| t.1).sum();
         let reg: Vec<u128> = calls().into_iter().filter(|c| c.0 == token && c.1 == "storage_deposit").map(|c| c.3).collect();
         assert_eq!(reg, vec![FT_STORAGE_REG.as_yoctonear()], "one registration");
@@ -6768,9 +6868,9 @@ mod v6_tests {
         assert!(sent_to("usdc.near", "c.near", 90));
         assert_eq!((f.get_fee_selling(U64(h)).holders_pending.0, mode_bucket(h)), (0, 0));
 
-        ctx("alice.near", f.quote_launch(0, None, Some(false)).total.0);
+        ctx("alice.near", f.quote_launch(0, None, Some(false), None).total.0);
         assert_eq!(panics(|| drop(f.launch(LaunchArgs { fee_to: Some(acct("seller.near")), ..args("AFS") }))), "fee_to: not the tax seller (it would be paid into the wallet that sells the fees)");
-        ctx("seller.near", f.quote_launch(0, None, Some(false)).total.0);
+        ctx("seller.near", f.quote_launch(0, None, Some(false), None).total.0);
         assert_eq!(panics(|| drop(f.launch(args("AFT")))), "fee_to: not the tax seller (it would be paid into the wallet that sells the fees)", "nor can the seller launch and be paid");
 
         let n = launch_paid(&mut f, "AFN", None, None, None, None);
@@ -6861,9 +6961,9 @@ mod v6_tests {
         ctx(tu.as_str(), 0);
         assert!(matches!(f.ft_on_transfer(acct("seller.near"), U128(1), format!(r#"{{"fee_return":{},"share":"holders"}}"#, u)), PromiseOrValue::Value(U128(1))));
 
-        ctx("alice.near", f.quote_launch(0, None, Some(false)).total.0);
+        ctx("alice.near", f.quote_launch(0, None, Some(false), None).total.0);
         assert_eq!(panics(|| drop(f.launch(LaunchArgs { creator_paid_in: Some("tokens".into()), ..args("BADC") }))), "creator_paid_in: near or pair");
-        ctx("alice.near", f.quote_launch(0, None, Some(false)).total.0);
+        ctx("alice.near", f.quote_launch(0, None, Some(false), None).total.0);
         assert_eq!(panics(|| drop(f.launch(LaunchArgs { holders_paid_in: Some("usd".into()), ..args("BADH") }))), "holders_paid_in: near or pair");
 
         keeper();
@@ -8078,7 +8178,7 @@ mod v6_tests {
         drop(f.resume(U64(id)));
         assert!(static_gas_of(b"on_pool_created").unwrap() >= GAS_POOL_STEP_CB);
 
-        let deposit = f.quote_launch(0, None, None).total.0;
+        let deposit = f.quote_launch(0, None, None, None).total.0;
         ctx_full("alice.near", deposit, T0, 80);
         assert!(panics(|| std::mem::forget(f.launch(args("LOW2")))).contains("attach more gas"));
     }
@@ -8219,7 +8319,7 @@ mod v6_tests {
 
     fn replay_dev_buy_launch(f: &mut Factory, tgas: u64, near: u128) -> u64 {
         let a = LaunchArgs { dev_buy: Some(U128(near)), ..args("INL") };
-        let deposit = f.quote_launch(0, a.dev_buy, None).total.0;
+        let deposit = f.quote_launch(0, a.dev_buy, None, None).total.0;
         ctx_tx("alice.near", "alice.near", deposit, tgas);
         drop(f.launch(a));
         let id = f.next_id - 1;
@@ -8322,7 +8422,7 @@ mod v6_tests {
         let near = 3 * 10u128.pow(24);
 
         let a = LaunchArgs { dev_buy: Some(U128(near)), ..args("L300") };
-        let deposit = f.quote_launch(0, a.dev_buy, None).total.0;
+        let deposit = f.quote_launch(0, a.dev_buy, None, None).total.0;
         ctx_tx("alice.near", "alice.near", deposit, 300);
         drop(f.launch(a));
         let id = f.next_id - 1;
@@ -8357,7 +8457,7 @@ mod v6_tests {
         assert!(calls().iter().all(|c| c.1 != "ft_transfer_call"));
 
         let a = LaunchArgs { dev_buy: Some(U128(near)), ..args("L250") };
-        let deposit = f.quote_launch(0, a.dev_buy, None).total.0;
+        let deposit = f.quote_launch(0, a.dev_buy, None, None).total.0;
         ctx_tx("alice.near", "alice.near", deposit, 250);
         drop(f.launch(a));
         let id2 = f.next_id - 1;
@@ -8520,7 +8620,7 @@ mod v6_tests {
         let near = 10u128.pow(24);
 
         let a = LaunchArgs { dev_buy: Some(U128(near)), ..args("BOT") };
-        let deposit = f.quote_launch(0, a.dev_buy, None).total.0;
+        let deposit = f.quote_launch(0, a.dev_buy, None, None).total.0;
         ctx_tx("bot.near", "user.near", deposit, 300);
         drop(f.launch(a));
         let id = f.next_id - 1;
@@ -8556,7 +8656,7 @@ mod v6_tests {
         owner();
         f.set_locker_add_buy(acct("lock.near"), flag);
         let a = LaunchArgs { dev_buy: Some(U128(near)), ..args("AB") };
-        let deposit = f.quote_launch(0, a.dev_buy, None).total.0;
+        let deposit = f.quote_launch(0, a.dev_buy, None, None).total.0;
         ctx_tx("alice.near", "alice.near", deposit, 300);
         drop(f.launch(a));
         let id = f.next_id - 1;
@@ -8722,7 +8822,7 @@ mod v6_tests {
         owner();
         f.set_locker_add_buy(acct("lock.near"), true);
         let a = LaunchArgs { dev_buy: near.map(U128), ..args(sym) };
-        let deposit = f.quote_launch(0, a.dev_buy, None).total.0;
+        let deposit = f.quote_launch(0, a.dev_buy, None, None).total.0;
         ctx_tx("alice.near", "alice.near", deposit, 270);
         drop(f.launch(a));
         let id = f.next_id - 1;
@@ -9466,7 +9566,7 @@ mod v6_tests {
         owner(); f.set_locker_add_gas(acct("lock.near"), T_LOCK3_ADD);
         owner(); f.set_locker_add_buy(acct("lock.near"), true);
         let a = LaunchArgs { dev_buy: Some(U128(near)), ..args("PA") };
-        let deposit = f.quote_launch(0, a.dev_buy, None).total.0;
+        let deposit = f.quote_launch(0, a.dev_buy, None, None).total.0;
         ctx_tx("alice.near", "alice.near", deposit, 300);
         drop(f.launch(a));
         let id = f.next_id - 1;
@@ -9504,7 +9604,7 @@ mod v6_tests {
     fn fix7_a_failed_token_create_refunds_the_creators_storage_once() {
         let mut f = factory();
         let id = launch(&mut f, "alice.near", "FAIL");
-        let storage = f.internal_cost(0, 8, 0, false).token_storage.0;
+        let storage = f.token_storage_of(0, 8, false);
         let pool = l(&f, id).pool_id;
         ctx(ME, 0);
         drop(f.on_created(id, Some(true), Err(PromiseError::Failed), Ok(pool.clone())));
@@ -9521,12 +9621,78 @@ mod v6_tests {
     #[test]
     fn fix9_quote_launch_covers_the_longest_text() {
         let mut f = factory();
-        let deposit = f.quote_launch(0, None, None).total.0;
+        let deposit = f.quote_launch(0, None, None, None).total.0;
         ctx("alice.near", deposit);
         let a = LaunchArgs { name: "\u{1F600}".repeat(32), description: Some("\u{1F600}".repeat(500)), ..args("LONGLONG10") };
-        let cost = f.internal_cost(0, a.name.len() + "LONGLONG10".len() + 2000, 0, false).total.0;
+        let cost = f.internal_cost(0, a.name.len() + "LONGLONG10".len(), a.name.len() + "LONGLONG10".len() + 2000, 0, false, f.pool_fronted()).total.0;
         drop(f.launch(a));
         assert_eq!(transfers().into_iter().filter(|t| t.0 == "alice.near").map(|t| t.1).sum::<u128>(), deposit - cost, "the surplus comes back in the same call");
+    }
+
+    fn flushed_usage(f: &mut Factory) -> u64 {
+        f.launches.flush(); f.token_index.flush(); f.symbol_index.flush(); f.creator_fees.flush(); f.quotes.flush();
+        env::storage_usage()
+    }
+
+    #[test]
+    fn record_storage_covers_what_a_launch_writes() {
+
+
+        let mut f = factory();
+        owner();
+        f.set_protocol_recipients(vec![(acct("p1.near"), 5000), (acct("p2.near"), 5000)]);
+        owner();
+        f.set_holders_pot(Some(acct("holderspot.near")));
+        owner();
+        f.set_referral_pot(Some(acct("referralpot.near")));
+        near_sdk::env::storage_write(TAX_CODE_KEY, &[7u8; 32]);
+        let creator = "a".repeat(64);
+        let link = format!("https://{}", "l".repeat(192));
+        let name = "\u{1F600}".repeat(32);
+        let text = (name.len() + "LONGLONG10".len() + 2000 + 3 * link.len()) as u128;
+        let a = LaunchArgs {
+            name, description: Some("\u{1F600}".repeat(500)),
+            links: Some(Links { website: Some(link.clone()), twitter: Some(link.clone()), telegram: Some(link) }),
+            fee_to: Some("b".repeat(64).parse().unwrap()),
+            tax: Some(TaxArgs { buy_bps: 400, sell_bps: 400, creator_bps: 3300, burn_bps: 3300, holders_bps: 3400 }),
+            ..args("LONGLONG10")
+        };
+
+        ctx(&creator, f.quote_launch(0, None, Some(true), None).total.0);
+        let before = flushed_usage(&mut f);
+        std::mem::forget(f.launch(a));
+        let id = f.next_id - 1;
+        park(&mut f, id, Step::Done);
+        let used = (flushed_usage(&mut f) - before) as u128;
+        println!("RECORD worst case: {used} B written, text {text} B, fixed {} B, charged fixed {}", used as i128 - text as i128, RECORD_BASE_BYTES);
+        assert!(used <= RECORD_BASE_BYTES + text, "record charge {} B < written {used} B", RECORD_BASE_BYTES + text);
+
+        ctx("bob.near", f.quote_launch(0, None, Some(false), None).total.0);
+        let before = flushed_usage(&mut f);
+        std::mem::forget(f.launch(args("PLAIN")));
+        let id = f.next_id - 1;
+        park(&mut f, id, Step::Done);
+        let used = (flushed_usage(&mut f) - before) as u128;
+        println!("RECORD plain: {used} B written, text 10 B, fixed {} B", used as i128 - 10);
+        assert!(used <= RECORD_BASE_BYTES + 10);
+    }
+
+    #[test]
+    fn exact_pricing_charges_what_is_stored_and_fronts_the_pool() {
+        let f = factory();
+        let q = f.quote_launch(0, None, Some(false), None);
+
+        assert_eq!(q.token_storage.0, (TOKEN_BASE_STORAGE_BYTES + MAX_TOKEN_TEXT_BYTES as u128) * STORAGE_PRICE_PER_BYTE + FT_STORAGE_REG.as_yoctonear());
+        assert_eq!(q.record_storage.0, (RECORD_BASE_BYTES + (MAX_TEXT_BYTES + MAX_LINKS_BYTES) as u128) * STORAGE_PRICE_PER_BYTE);
+        assert_eq!(q.pool_create.0, DCL_POOL_CHARGE.as_yoctonear(), "the float fronts create_pool");
+        assert_eq!(q.total.0, q.launch_fee.0 + q.token_storage.0 + q.record_storage.0 + q.pool_create.0 + q.dcl_storage.0);
+
+        let mut f = factory();
+        let id = launch(&mut f, "alice.near", "POOL");
+        park(&mut f, id, Step::CreatePool);
+        ctx(ME, 0);
+        drop(f.internal_pool_batch(&l(&f, id)));
+        assert!(calls().iter().any(|c| c.1 == "create_pool" && c.3 == DCL_POOL_CREATE.as_yoctonear()), "{:?}", calls());
     }
 
     #[test]
@@ -9760,3 +9926,194 @@ fn locker_add_gas_key(locker: &AccountId) -> Vec<u8> { [b"lg:".as_slice(), locke
 fn locker_add_gas(locker: &AccountId) -> Option<Gas> {
     env::storage_read(&locker_add_gas_key(locker)).map(|b| Gas::from_tgas(u64::from_le_bytes(b.try_into().expect("locker gas"))))
 }
+
+
+#[cfg(test)]
+mod rv_exact {
+    use super::*;
+    use super::v6_tests::{args, calls, ctx, factory, l, mainnet_fees, transfers};
+    use near_sdk::test_utils::VMContextBuilder;
+
+    fn acct(a: &str) -> AccountId { a.parse().unwrap() }
+    fn flushed(f: &mut Factory) -> u64 {
+        f.launches.flush(); f.token_index.flush(); f.symbol_index.flush(); f.creator_fees.flush(); f.quotes.flush();
+        env::storage_usage()
+    }
+
+
+
+    #[test]
+    fn rv_record_worst_case_through_callbacks() {
+        let mut f = factory();
+        ctx("owner.near", 0);
+        f.set_protocol_recipients(vec![(acct("protocolfee.near"), 5000), (acct("protocolfee2.near"), 5000)]);
+        ctx("owner.near", 0);
+        f.set_holders_pot(Some(acct("nearlyholderspot.near")));
+        ctx("owner.near", 0);
+        f.set_referral_pot(Some(acct("referralpot.near")));
+        let q64 = acct("17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1");
+        ctx("owner.near", 0);
+        f.set_quote(q64.clone(), 6, -400_000, -400_000, -400_000, 400_000, true);
+        near_sdk::env::storage_write(TAX_CODE_KEY, &[7u8; 32]);
+        set_slug_count("longlonglong", 9);
+        let creator = "a".repeat(64);
+        let link = format!("https://{}", "l".repeat(192));
+        let name = "\u{1F600}".repeat(32);
+        let icon = format!("data:image/png;base64,{}", "A".repeat(100));
+        let text = (name.len() + 12 + 2000 + 3 * link.len()) as u128;
+        let a = LaunchArgs {
+            name, description: Some("\u{1F600}".repeat(500)),
+            links: Some(Links { website: Some(link.clone()), twitter: Some(link.clone()), telegram: Some(link) }),
+            fee_to: Some("b".repeat(64).parse().unwrap()),
+            tax: Some(TaxArgs { buy_bps: 400, sell_bps: 400, creator_bps: 3300, burn_bps: 3300, holders_bps: 3400 }),
+            quote: Some(q64.clone()),
+            icon: Some(icon.clone()),
+            creator_paid_in: Some("pair".into()),
+            holders_paid_in: Some("near".into()),
+            ..args("LONGLONGLONG")
+        };
+        let deposit = f.quote_launch(icon.len() as u32, None, Some(true), None).total.0;
+        near_sdk::testing_env!(VMContextBuilder::new()
+            .current_account_id(acct("nearlytrade.near")).predecessor_account_id(acct(&creator))
+            .attached_deposit(NearToken::from_yoctonear(deposit)).account_balance(NearToken::from_near(500))
+            .block_timestamp(1_700_000_000_000 * 1_000_000).prepaid_gas(Gas::from_tgas(300)).build(), near_sdk::test_vm_config(), mainnet_fees());
+        let before = flushed(&mut f);
+        std::mem::forget(f.launch(a));
+        let id = f.next_id - 1;
+        let at_launch = flushed(&mut f) - before;
+        let pool = l(&f, id).pool_id.clone();
+        println!("token {} ({} ch) pool_id {} ch", l(&f, id).token, l(&f, id).token.as_str().len(), pool.len());
+
+        let cb_ctx = |u: u64| near_sdk::testing_env!(VMContextBuilder::new()
+            .current_account_id(acct("nearlytrade.near")).predecessor_account_id(acct("nearlytrade.near"))
+            .account_balance(NearToken::from_near(500)).storage_usage(u)
+            .block_timestamp(1_700_000_000_000 * 1_000_000).prepaid_gas(Gas::from_tgas(300)).build(), near_sdk::test_vm_config(), mainnet_fees());
+        cb_ctx(flushed(&mut f));
+        let mut lz = l(&f, id); lz.inflight = false; f.launches.insert(id, lz);
+        drop(f.on_created(id, Some(true), Ok(StorageBalanceJson { total: "0".into() }), Ok(pool.clone())));
+        println!("after on_created: step {:?}", l(&f, id).step);
+        cb_ctx(flushed(&mut f));
+        let mut lz = l(&f, id); lz.inflight = false; f.launches.insert(id, lz);
+        drop(f.on_liquidity_added(id, Some(true), Ok(format!("{}#123456", pool))));
+        assert_eq!(l(&f, id).step, Step::Done);
+        let used = (flushed(&mut f) - before) as u128;
+        println!("RV RECORD real callbacks: at launch {} B (icon {} B in it, uncharged), at Done {used} B; text {text} B -> fixed {} B vs RECORD_BASE_BYTES {}",
+            at_launch, icon.len(), used as i128 - text as i128, RECORD_BASE_BYTES);
+        assert!(used <= RECORD_BASE_BYTES + text, "record charged {} B < written {used} B (short {} B)", RECORD_BASE_BYTES + text, used - RECORD_BASE_BYTES - text);
+    }
+
+
+
+
+    #[test]
+    fn rv_svg_icon_with_quotes_underfunds_the_token() {
+        for reps in [0usize, 20, 40, 80] {
+            let mut f = factory();
+            let creator = "c".repeat(64);
+            let icon = format!("data:image/svg+xml;utf8,<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\">{}</svg>",
+                "<rect x=\"1\" y=\"2\" width=\"3\" height=\"4\" fill=\"#0a0\"/>".repeat(reps));
+            let a = LaunchArgs { icon: Some(icon.clone()), ..args("SVG") };
+            let deposit = f.quote_launch(json_len(&icon) as u32, None, None, None).total.0;
+            ctx(&creator, deposit);
+            drop(f.launch(a));
+            let id = f.next_id - 1;
+            let tok = l(&f, id).token.to_string();
+            let funded: u128 = transfers().into_iter().filter(|t| t.0 == tok).map(|t| t.1).sum::<u128>() + FT_STORAGE_REG.as_yoctonear();
+            let new_args = calls().into_iter().find(|c| c.0 == tok && c.1 == "new").expect("new").2;
+            let ms = new_args.find("\"metadata\":").unwrap() + "\"metadata\":".len();
+            let me = new_args.find(",\"rules\":").unwrap();
+            let meta_len = me - ms;
+            let locker = f.locker_for(id).to_string();
+
+            let need = 132 + 57 + 57 + (41 + meta_len) + (57 + locker.len()) + (57 + creator.len());
+            let quotes = icon.matches('"').count();
+            println!("RV SVG icon {} B with {} quotes: metadata stored {} B, token needs {} B at create, funded {} B -> {}",
+                icon.len(), quotes, meta_len, need, funded / STORAGE_PRICE_PER_BYTE,
+                if funded >= need as u128 * STORAGE_PRICE_PER_BYTE { "ok".to_string() } else { format!("SHORT {} B: LackBalanceForState, launch Failed", need as u128 - funded / STORAGE_PRICE_PER_BYTE) });
+            assert!(funded >= need as u128 * STORAGE_PRICE_PER_BYTE, "token underfunded with {quotes} quotes");
+        }
+    }
+
+
+
+
+    #[test]
+    fn rv_float_check_counts_the_creators_own_deposit() {
+        let mut f = factory();
+        let near = 2 * 10u128.pow(24);
+        let s0: u64 = 100_000;
+        let locked = s0 as u128 * STORAGE_PRICE_PER_BYTE;
+        let mut c = VMContextBuilder::new();
+        c.current_account_id(acct("nearlytrade.near")).predecessor_account_id(acct("alice.near"))
+            .account_balance(NearToken::from_yoctonear(locked)).storage_usage(s0).prepaid_gas(Gas::from_tgas(300))
+            .block_timestamp(1_700_000_000_000 * 1_000_000);
+        near_sdk::testing_env!(c.build(), near_sdk::test_vm_config(), mainnet_fees());
+        assert!(!f.pool_fronted(), "nothing free: a quote charges the full attach");
+        let q = f.quote_launch(0, Some(U128(near)), None, None);
+        assert_eq!(q.pool_create.0, DCL_POOL_CREATE.as_yoctonear());
+
+        let deposit = q.total.0;
+
+        c.attached_deposit(NearToken::from_yoctonear(deposit)).account_balance(NearToken::from_yoctonear(locked));
+        near_sdk::testing_env!(c.build(), near_sdk::test_vm_config(), mainnet_fees());
+        drop(f.launch(LaunchArgs { dev_buy: Some(U128(near)), ..args("FLOAT") }));
+        let id = f.next_id - 1;
+        let fronted = !env::storage_has_key(&pool_full_key(id));
+        let held = l(&f, id).dev_buy_held.0;
+        let out: u128 = near_sdk::test_utils::get_created_receipts().iter().flat_map(|r| r.actions.iter()).map(|a| match a {
+            near_sdk::mock::MockAction::Transfer { deposit, .. } => deposit.as_yoctonear(),
+            near_sdk::mock::MockAction::FunctionCallWeight { attached_deposit, .. } => attached_deposit.as_yoctonear(),
+            _ => 0,
+        }).sum();
+        let after = locked + deposit - out;
+        let need = env::storage_usage() as u128 * STORAGE_PRICE_PER_BYTE + held;
+        println!("RV FLOAT: free before 0 N, quote pool_create {} N, launch fronted={} (charged {} N); after the launch receipt the balance is {:.4} N short of storage + the held dev buy until Rhea refunds",
+            q.pool_create.0 as f64 / 1e24, fronted, if fronted { 0.012 } else { 0.1 }, (need as f64 - after as f64) / 1e24);
+        assert!(!fronted, "a launchpad with nothing free fronted create_pool out of the creator's held dev buy");
+    }
+
+
+
+    #[test]
+    fn rv_failed_token_create_keeps_the_uncharged_icon() {
+        let mut f = factory();
+        f.dcl_registered = true;
+        let creator = "griefer.near";
+        let icon = format!("data:image/svg+xml;utf8,{}", "\"".repeat(16_000));
+        let a = LaunchArgs { icon: Some(icon.clone()), ..args("GRIEF") };
+        let deposit = f.quote_launch(json_len(&icon) as u32, None, None, Some(10)).total.0;
+        let mk = |pred: &str, dep: u128, u: u64| near_sdk::testing_env!(VMContextBuilder::new()
+            .current_account_id(acct("nearlytrade.near")).predecessor_account_id(acct(pred))
+            .attached_deposit(NearToken::from_yoctonear(dep)).account_balance(NearToken::from_near(500)).storage_usage(u)
+            .block_timestamp(1_700_000_000_000 * 1_000_000).prepaid_gas(Gas::from_tgas(300)).build(), near_sdk::test_vm_config(), mainnet_fees());
+        mk(creator, deposit, 0);
+        let before = flushed(&mut f);
+        drop(f.launch(a));
+        let id = f.next_id - 1;
+        let back1: u128 = transfers().into_iter().filter(|t| t.0 == creator).map(|t| t.1).sum();
+        let pool = l(&f, id).pool_id.clone();
+        mk("nearlytrade.near", 0, flushed(&mut f));
+        drop(f.on_created(id, Some(true), Err(PromiseError::Failed), Ok(pool)));
+        let back2: u128 = transfers().into_iter().filter(|t| t.0 == creator).map(|t| t.1).sum();
+        let used = (flushed(&mut f) - before) as u128;
+        let cost = deposit - back1 - back2;
+        println!("RV GRIEF: launch Failed={}, record keeps icon {} B; factory storage +{used} B (= {:.4} N locked), record_storage charged {:.4} N; creator net cost {:.4} N (+gas)",
+            l(&f, id).step == Step::Failed, l(&f, id).icon.as_ref().map(|i| i.len()).unwrap_or(0), used as f64 / 1e5,
+            f.internal_cost(json_len(&icon), 10, 10, 0, false, true).record_storage.0 as f64 / 1e24, cost as f64 / 1e24);
+        assert!(l(&f, id).icon.is_none(), "a Failed launch keeps a {} B icon nobody paid for", icon.len());
+    }
+
+    #[test]
+    fn rv_a_launch_priced_before_the_upgrade_keeps_its_old_refunds() {
+        let mut f = factory();
+        let near = 2 * 10u128.pow(24);
+        let id = super::v6_tests::created_but_pool_refused(&mut f, near);
+
+        env::storage_write(EXACT_FROM_KEY, &(id + 1).to_le_bytes());
+        let point = l(&f, id).init_point;
+        ctx("nearlytrade.near", 0);
+        drop(f.on_pool_checked(id, None, Ok(Some(near_sdk::serde_json::json!({"current_point": point + 200})))));
+        assert_eq!(transfers(), vec![("alice.near".to_string(), DCL_POOL_CREATE.as_yoctonear())], "it paid the old 0.1 N");
+    }
+}
+
