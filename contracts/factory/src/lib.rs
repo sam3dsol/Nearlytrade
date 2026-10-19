@@ -24,13 +24,16 @@ const TOKEN_BASE_STORAGE_BYTES: u128 = 3_000;
 
 
 const PROTOCOL_BPS: u16 = 2_000;
-const BURN_POT_BPS: u16 = 0;
+const HOLDERS_POT_BPS: u16 = 1_000;
 const REFERRAL_POT_BPS: u16 = 1_000;
-const _: () = assert!(7_000 + PROTOCOL_BPS + BURN_POT_BPS + REFERRAL_POT_BPS == 10_000, "the four parts make the whole fee");
+const _: () = assert!(MIN_CREATOR_SHARE_BPS + PROTOCOL_BPS + HOLDERS_POT_BPS + REFERRAL_POT_BPS == 10_000, "the four parts make the whole fee");
 
-const BURN_POT_KEY: &[u8] = b"bpt";
+
+const HOLDERS_POT_KEY: &[u8] = b"hpt";
 const REFERRAL_POT_KEY: &[u8] = b"rpt";
-fn burn_pot() -> Option<AccountId> { env::storage_read(BURN_POT_KEY).map(|b| String::from_utf8(b).expect("burn pot").parse().expect("burn pot")) }
+
+const NEARLY_HOLDERS_POT: &str = "holderspot.near";
+fn holders_pot() -> Option<AccountId> { env::storage_read(HOLDERS_POT_KEY).map(|b| String::from_utf8(b).expect("holders pot").parse().expect("holders pot")) }
 fn referral_pot() -> Option<AccountId> { env::storage_read(REFERRAL_POT_KEY).map(|b| String::from_utf8(b).expect("referral pot").parse().expect("referral pot")) }
 
 const FT_STORAGE_REG: NearToken = NearToken::from_yoctonear(1_250_000_000_000_000_000_000);
@@ -248,8 +251,11 @@ const FM_HOLDERS: u8 = 2;
 
 
 
-const MIN_CREATOR_SHARE_BPS: u16 = 7_000;
-const MAX_CREATOR_SHARE_BPS: u16 = 7_000;
+const MIN_CREATOR_SHARE_BPS: u16 = 6_000;
+const MAX_CREATOR_SHARE_BPS: u16 = 6_000;
+
+
+const UNRECORDED_SHARE_BPS: u16 = 7_000;
 
 const MAX_RELAYERS: usize = 16;
 const MAX_FEE_ROUTERS: usize = 32;
@@ -269,7 +275,8 @@ const MAX_TAX_BPS: u16 = 400;
 
 
 
-const PLATFORM_TAX_BPS: u16 = PROTOCOL_BPS + BURN_POT_BPS + REFERRAL_POT_BPS;
+
+const PLATFORM_TAX_BPS: u16 = PROTOCOL_BPS + HOLDERS_POT_BPS + REFERRAL_POT_BPS;
 
 const TAX_EXTRA_BYTES: u128 = 600;
 
@@ -1525,7 +1532,7 @@ impl Factory {
             return false;
         }
         let (fee_tok, fee_quote) = if l.token_is_x { (v[0].0, v[1].0) } else { (v[1].0, v[0].0) };
-        let (mode, share_bps) = fee_opts(id, self.config.creator_fee_share_bps);
+        let (mode, share_bps) = fee_opts(id, UNRECORDED_SHARE_BPS);
         let share = l_share(share_bps);
         let c_quote = fee_quote * share / BPS;
         let p_quote = fee_quote - c_quote;
@@ -2279,23 +2286,23 @@ impl Factory {
 
 
 
-    pub fn set_burn_pot(&mut self, account_id: Option<AccountId>) {
+    pub fn set_holders_pot(&mut self, account_id: Option<AccountId>) {
         self.assert_owner();
-        require!(account_id.as_ref() != Some(&env::current_account_id()), "burn pot: not the launchpad itself");
+        require!(account_id.as_ref() != Some(&env::current_account_id()), "holders pot: not the launchpad itself");
         self.assert_pot_legs_fit(self.protocol_recipients.len(), account_id.is_some(), referral_pot().is_some());
         match account_id {
-            Some(a) => env::storage_write(BURN_POT_KEY, a.as_bytes()),
-            None => env::storage_remove(BURN_POT_KEY),
+            Some(a) => env::storage_write(HOLDERS_POT_KEY, a.as_bytes()),
+            None => env::storage_remove(HOLDERS_POT_KEY),
         };
     }
-    pub fn get_burn_pot(&self) -> Option<AccountId> { burn_pot() }
+    pub fn get_holders_pot(&self) -> Option<AccountId> { holders_pot() }
 
 
 
     pub fn set_referral_pot(&mut self, account_id: Option<AccountId>) {
         self.assert_owner();
         require!(account_id.as_ref() != Some(&env::current_account_id()), "referral pot: not the launchpad itself");
-        self.assert_pot_legs_fit(self.protocol_recipients.len(), burn_pot().is_some(), account_id.is_some());
+        self.assert_pot_legs_fit(self.protocol_recipients.len(), holders_pot().is_some(), account_id.is_some());
         match account_id {
             Some(a) => env::storage_write(REFERRAL_POT_KEY, a.as_bytes()),
             None => env::storage_remove(REFERRAL_POT_KEY),
@@ -2351,7 +2358,7 @@ impl Factory {
     }
 
     pub fn get_fee_opts(&self, launch_id: U64) -> FeeOpts {
-        let (mode, share) = fee_opts(launch_id.0, self.config.creator_fee_share_bps);
+        let (mode, share) = fee_opts(launch_id.0, UNRECORDED_SHARE_BPS);
         FeeOpts {
             mode: mode_name(mode).to_string(),
             creator_share_bps: share,
@@ -2371,11 +2378,10 @@ impl Factory {
 
 
 
-
     pub fn backfill_fee_opts(&mut self, ids: Vec<U64>) -> u32 {
         self.assert_owner();
         require!(ids.len() <= 200, "max 200 ids");
-        let share = self.config.creator_fee_share_bps;
+        let share = UNRECORDED_SHARE_BPS;
         let mut n = 0u32;
         for i in ids {
             if i.0 >= self.next_id || env::storage_has_key(&fee_opts_key(i.0)) {
@@ -2535,8 +2541,8 @@ impl Factory {
 
 
     fn pot_recipients(&self, share: u16) -> Option<Vec<(AccountId, u16)>> {
-        let (burn, refp) = (burn_pot(), referral_pot());
-        if (burn.is_none() && refp.is_none()) || self.protocol_recipients.is_empty() {
+        let (hold, refp) = (holders_pot(), referral_pot());
+        if (hold.is_none() && refp.is_none()) || self.protocol_recipients.is_empty() {
             return None;
         }
         let rest = 10_000u32.saturating_sub(share as u32);
@@ -2544,12 +2550,12 @@ impl Factory {
             return None;
         }
         let part = |bps: u16| (bps as u32 * 10_000 / rest).min(10_000);
-        let burn_part = if burn.is_some() { part(BURN_POT_BPS) } else { 0 };
+        let hold_part = if hold.is_some() { part(HOLDERS_POT_BPS) } else { 0 };
         let ref_part = if refp.is_some() { part(REFERRAL_POT_BPS) } else { 0 };
-        if burn_part + ref_part >= 10_000 {
+        if hold_part + ref_part >= 10_000 {
             return None;
         }
-        let left = 10_000 - burn_part - ref_part;
+        let left = 10_000 - hold_part - ref_part;
         let total: u32 = self.protocol_recipients.iter().map(|(_, b)| *b as u32).sum();
         let mut rc: Vec<(AccountId, u16)> = Vec::new();
         let mut add = |who: &AccountId, bps: u32| {
@@ -2565,7 +2571,7 @@ impl Factory {
             given += p;
             add(who, p);
         }
-        if let Some(b) = &burn { add(b, burn_part); }
+        if let Some(h) = &hold { add(h, hold_part); }
         if let Some(r) = &refp { add(r, ref_part); }
         if rc.len() > 4 {
             emit("pot_legs_dropped", &format!(r#"{{"legs":{}}}"#, rc.len()));
@@ -2606,14 +2612,14 @@ impl Factory {
     pub fn set_protocol_recipients(&mut self, recipients: Vec<(AccountId, u16)>) {
         self.assert_owner();
         validate_protocol_recipients(&recipients);
-        self.assert_pot_legs_fit(recipients.len(), burn_pot().is_some(), referral_pot().is_some());
+        self.assert_pot_legs_fit(recipients.len(), holders_pot().is_some(), referral_pot().is_some());
         self.protocol_recipients = recipients;
     }
 
 
 
-    fn assert_pot_legs_fit(&self, protocol: usize, burn: bool, refp: bool) {
-        let pots = burn as usize + refp as usize;
+    fn assert_pot_legs_fit(&self, protocol: usize, hold: bool, refp: bool) {
+        let pots = hold as usize + refp as usize;
         require!(pots == 0 || protocol + pots <= 4, "pots: protocol recipients plus pots must be 4 legs or fewer");
     }
 
@@ -3352,8 +3358,20 @@ impl Factory {
 
 
 
+
+
     #[private]
-    pub fn migrate(&self) -> bool {
+    pub fn migrate(&mut self) -> bool {
+        if self.config.creator_fee_share_bps != MIN_CREATOR_SHARE_BPS {
+            self.config.creator_fee_share_bps = MIN_CREATOR_SHARE_BPS;
+            emit("creator_share_set", &format!(r#"{{"creator_share_bps":{}}}"#, MIN_CREATOR_SHARE_BPS));
+        }
+        if holders_pot().is_none() {
+            let pot: AccountId = NEARLY_HOLDERS_POT.parse().unwrap();
+            self.assert_pot_legs_fit(self.protocol_recipients.len(), true, referral_pot().is_some());
+            env::storage_write(HOLDERS_POT_KEY, pot.as_bytes());
+            emit("holders_pot_set", &format!(r#"{{"account":"{}"}}"#, pot));
+        }
         true
     }
 
@@ -4534,7 +4552,7 @@ impl Config {
             max_init_point: 15_200,
             range_points: 1_000_000,
             launch_fee: U128(0),
-            creator_fee_share_bps: 7_000,
+            creator_fee_share_bps: 6_000,
             dcl_storage_per_launch: U128(20 * 10u128.pow(21)),
             max_icon_bytes: 16 * 1024,
             unique_symbols: false,
@@ -4550,7 +4568,7 @@ impl Config {
         require!(self.min_init_point <= self.init_point && self.init_point <= self.max_init_point, "init_point outside bounds");
         require!(self.range_points >= 2 * POINT_DELTA_1PCT, "range_points too small");
 
-        require!((MIN_CREATOR_SHARE_BPS..=MAX_CREATOR_SHARE_BPS).contains(&self.creator_fee_share_bps), "creator_fee_share_bps: 7000");
+        require!((MIN_CREATOR_SHARE_BPS..=MAX_CREATOR_SHARE_BPS).contains(&self.creator_fee_share_bps), "creator_fee_share_bps: 6000");
         require!(self.max_icon_bytes <= 32 * 1024, "icon cap max 32KB");
         require!(self.max_dev_buy_bps <= 2_000, "dev buy cap max 20%");
         require!(self.max_wallet_bps == 0 || self.max_dev_buy_bps <= self.max_wallet_bps, "dev buy cap must fit the max wallet");
@@ -5930,28 +5948,28 @@ mod v6_tests {
     }
 
     #[test]
-    fn every_new_launch_splits_its_fee_70_20_10_and_the_creator_cannot_pick() {
+    fn every_new_launch_splits_its_fee_60_20_10_10_and_the_creator_cannot_pick() {
         let mut f = factory();
         owner();
         f.set_protocol_recipients(vec![(acct("p1.near"), 5000), (acct("p2.near"), 5000)]);
-        assert_eq!(f.config.creator_fee_share_bps, 7000, "the config default is the fixed share");
+        assert_eq!(f.config.creator_fee_share_bps, 6000, "the config default is the fixed share");
 
         let id0 = launch_scheduled(&mut f, "alice.near", args("PLAIN"));
         assert_eq!(f.get_launch_recipients(U64(id0)), None);
 
         owner();
-        f.set_burn_pot(Some(acct("burn.near")));
+        f.set_holders_pot(Some(acct("holders.near")));
         f.set_referral_pot(Some(acct("refpot.near")));
-        assert_eq!((f.get_burn_pot(), f.get_referral_pot()), (Some(acct("burn.near")), Some(acct("refpot.near"))));
+        assert_eq!((f.get_holders_pot(), f.get_referral_pot()), (Some(acct("holders.near")), Some(acct("refpot.near"))));
         let id1 = launch_scheduled(&mut f, "alice.near", args("FOUR"));
-        assert_eq!(f.get_launch_recipients(U64(id1)).unwrap(), vec![(acct("p1.near"), 3333), (acct("p2.near"), 3334), (acct("refpot.near"), 3333)]);
+        assert_eq!(f.get_launch_recipients(U64(id1)).unwrap(), vec![(acct("p1.near"), 2500), (acct("p2.near"), 2500), (acct("holders.near"), 2500), (acct("refpot.near"), 2500)]);
         assert!(logs_with("launch_split")[0].contains(r#""recipients""#));
-        assert_eq!(fee_opts(id1, 8000), (FM_CREATOR, 7000), "70% stored for the launch");
+        assert_eq!(fee_opts(id1, 8000), (FM_CREATOR, 6000), "60% stored for the launch");
 
         owner();
         f.set_referral_pot(None);
         let id2 = launch_scheduled(&mut f, "alice.near", args("ONEPOT"));
-        assert_eq!(f.get_launch_recipients(U64(id2)).unwrap(), vec![(acct("p1.near"), 5000), (acct("p2.near"), 5000)]);
+        assert_eq!(f.get_launch_recipients(U64(id2)).unwrap(), vec![(acct("p1.near"), 3750), (acct("p2.near"), 3750), (acct("holders.near"), 2500)]);
 
         ctx("bob.near", f.quote_launch(0, None, None).total.0);
         assert_eq!(panics(|| drop(f.launch(LaunchArgs { creator_share_bps: Some(8000), ..args("PICK") }))), "creator_share_bps: the launchpad's current share, or leave it out");
@@ -5961,7 +5979,7 @@ mod v6_tests {
         near_sdk::env::storage_write(TAX_CODE_KEY, &[7u8; 32]);
         near_sdk::env::storage_write(TAX_SELLER_KEY, b"seller.near");
         let id3 = launch_scheduled(&mut f, "alice.near", LaunchArgs { tax: Some(TaxArgs { buy_bps: 300, sell_bps: 300, creator_bps: 5000, burn_bps: 2000, holders_bps: 3000 }), ..args("TAXN") });
-        assert_eq!(tax_opts_full(id3).unwrap().1, 3000, "new tax launches carry the 30% platform cut");
+        assert_eq!(tax_opts_full(id3).unwrap().1, 4000, "new tax launches carry the 40% platform cut");
         park(&mut f, id3, Step::Done);
         add_counter(&tax_selling_key(id3), 8_400);
         let pf0 = f.protocol_fees;
@@ -5970,7 +5988,7 @@ mod v6_tests {
         assert_eq!(f.protocol_fees, pf0, "the platform cut went to the launch's own split, not the shared bucket");
         let t = f.get_tax(U64(id3)).unwrap();
 
-        assert_eq!(t.paid_platform.0, 348, "the platform cut, pro rata to the sold parts");
+        assert_eq!(t.paid_platform.0, 454, "the platform cut, pro rata to the sold parts");
     }
 
     #[test]
@@ -5978,7 +5996,7 @@ mod v6_tests {
         let mut f = factory();
         let icon = icon_of(f.config.max_icon_bytes as usize);
         let id = launch_scheduled(&mut f, "alice.near", LaunchArgs {
-            icon: Some(icon.clone()), fee_mode: Some("burn".into()), creator_share_bps: Some(7000), fee_to: Some("x".repeat(64).parse().unwrap()),
+            icon: Some(icon.clone()), fee_mode: Some("burn".into()), creator_share_bps: Some(6000), fee_to: Some("x".repeat(64).parse().unwrap()),
             name: "\u{1F600}".repeat(32), ..args("BIGICON")
         });
         assert_eq!(l(&f, id).icon.map(|i| i.len()), Some(icon.len()));
@@ -6172,15 +6190,15 @@ mod v6_tests {
         let v = if l(&f, id).token_is_x { vec![U128(0), U128(1_000)] } else { vec![U128(1_000), U128(0)] };
         ctx_gas(ME, 100);
         assert!(f.on_fees_claimed(id, Ok(v)));
-        assert_eq!((mode_bucket(id), l(&f, id).creator_quote_fees.0, l(&f, id).protocol_quote_fees.0), (700, 0, 300));
-        assert_eq!(f.get_fee_opts(U64(id)).bucket.0, 700);
+        assert_eq!((mode_bucket(id), l(&f, id).creator_quote_fees.0, l(&f, id).protocol_quote_fees.0), (600, 0, 400));
+        assert_eq!(f.get_fee_opts(U64(id)).bucket.0, 600);
 
         ctx("owner.near", 0);
         let eleven: Vec<(AccountId, U128)> = (0..11).map(|i| (acct(&format!("h{i}.near")), U128(1))).collect();
         assert!(panics(|| f.pay_holders_t(U64(id), eleven, None, None)).contains("too many payouts"));
         ctx("owner.near", 0);
         f.pay_holders_t(U64(id), vec![(acct("a.near"), U128(400)), (acct("b.near"), U128(100))], None, None);
-        assert_eq!((mode_bucket(id), read_counter(&paid_key(id))), (200, 500));
+        assert_eq!((mode_bucket(id), read_counter(&paid_key(id))), (100, 500));
         let c = calls();
         assert!(c.iter().any(|c| c.0 == "usdc.near" && c.1 == "ft_transfer" && c.2.contains(r#""receiver_id":"a.near""#) && c.2.contains(r#""amount":"400""#)), "{c:?}");
         assert!(transfers().is_empty(), "no NEAR leaves for a pair launch");
@@ -6188,7 +6206,7 @@ mod v6_tests {
 
         ctx_results(vec![near_sdk::PromiseResult::Failed]);
         f.on_paid(U64(id), "quote".into(), acct("b.near"), U128(100), "mode".into(), false);
-        assert_eq!((mode_bucket(id), f.get_owed("usdc.near".into(), acct("b.near")).0), (200, 100));
+        assert_eq!((mode_bucket(id), f.get_owed("usdc.near".into(), acct("b.near")).0), (100, 100));
 
         ctx("alice.near", 1);
         assert_eq!(panics(|| drop(f.claim_creator_quote_fees(U64(id)))), "this launch's fees go to buyback or holders");
@@ -6220,13 +6238,13 @@ mod v6_tests {
     fn pots_refuse_the_launchpad_and_a_split_that_would_not_fit() {
         let mut f = factory();
         owner();
-        assert_eq!(panics(|| f.set_burn_pot(Some(acct(ME)))), "burn pot: not the launchpad itself");
+        assert_eq!(panics(|| f.set_holders_pot(Some(acct(ME)))), "holders pot: not the launchpad itself");
         owner();
         assert_eq!(panics(|| f.set_referral_pot(Some(acct(ME)))), "referral pot: not the launchpad itself");
         owner();
         f.set_protocol_recipients(vec![(acct("p1.near"), 3400), (acct("p2.near"), 3300), (acct("p3.near"), 3300)]);
         owner();
-        f.set_burn_pot(Some(acct("burn.near")));
+        f.set_holders_pot(Some(acct("holders.near")));
 
         owner();
         assert!(panics(|| f.set_referral_pot(Some(acct("refpot.near")))).contains("4 legs or fewer"));
@@ -6237,10 +6255,10 @@ mod v6_tests {
         f.set_protocol_recipients(vec![(acct("p1.near"), 5000), (acct("p2.near"), 5000)]);
         owner();
         f.set_referral_pot(Some(acct("refpot.near")));
-        assert_eq!(f.pot_recipients(7000).unwrap().len(), 3);
+        assert_eq!(f.pot_recipients(6000).unwrap().len(), 4);
 
         owner();
-        f.set_burn_pot(None);
+        f.set_holders_pot(None);
     }
 
     #[test]
@@ -6641,7 +6659,7 @@ mod v6_tests {
         ctx_gas(ME, 100);
         assert!(f.on_fees_claimed(h, Ok(v)));
         let fs = f.get_fee_selling(U64(h));
-        assert_eq!((mode_bucket(h), fs.holders_pending.0, l(&f, h).protocol_quote_fees.0, fs.holders_paid_in.as_str()), (0, 700, 300, "near"));
+        assert_eq!((mode_bucket(h), fs.holders_pending.0, l(&f, h).protocol_quote_fees.0, fs.holders_paid_in.as_str()), (0, 600, 400, "near"));
         keeper();
         assert_eq!(panics(|| f.pay_holders_t(U64(h), vec![(acct("a.near"), U128(1))], None, None)), "payouts exceed what this launch earned for its holders");
         ctx("bob.near", 0);
@@ -6652,11 +6670,11 @@ mod v6_tests {
         assert_eq!(panics(|| f.pay_holders_t(U64(h), vec![(acct("a.near"), U128(1))], None, Some(U128(5)))), "max_amount goes with min_out");
         keeper();
         f.pay_holders_t(U64(h), vec![], Some(U128(60)), None);
-        assert!(sent_to("usdc.near", "seller.near", 700));
-        to_seller(&mut f, h, "holders", "quote", 700, 60);
+        assert!(sent_to("usdc.near", "seller.near", 600));
+        to_seller(&mut f, h, "holders", "quote", 600, 60);
         let tenth = 10u128.pow(23);
         ctx("seller.near", tenth);
-        assert!(f.fee_proceeds(U64(h), "holders".into(), "quote".into(), U128(700)));
+        assert!(f.fee_proceeds(U64(h), "holders".into(), "quote".into(), U128(600)));
         assert_eq!((mode_bucket(h), f.get_fee_selling(U64(h)).holders_near.0), (0, tenth), "the NEAR waits in its own pot, never the pair-token bucket");
 
         keeper();
@@ -6908,19 +6926,20 @@ mod v6_tests {
         let mut c = f.config.clone();
         c.creator_fee_share_bps = 8_000;
         ctx("owner.near", 0);
-        assert_eq!(panics(|| f.set_config(c)), "creator_fee_share_bps: 7000", "the share is fixed, not a setting");
-        assert_eq!(f.get_fee_opts(U64(id)).creator_share_bps, 7_000);
+        assert_eq!(panics(|| f.set_config(c)), "creator_fee_share_bps: 6000", "the share is fixed, not a setting");
+        assert_eq!(f.get_fee_opts(U64(id)).creator_share_bps, 6_000);
     }
 
     #[test]
-    fn backfill_pins_the_default_on_old_launches_only() {
+    fn backfill_pins_the_unrecorded_share_on_old_launches_only() {
         let mut f = factory();
         let old = launch(&mut f, "alice.near", "OLD");
-        let custom = launch_with(&mut f, "alice.near", LaunchArgs { creator_share_bps: Some(7_000), ..args("CUS") });
+        let custom = launch_with(&mut f, "alice.near", LaunchArgs { creator_share_bps: Some(6_000), ..args("CUS") });
         env::storage_remove(&fee_opts_key(old));
+        assert_eq!(f.get_fee_opts(U64(old)).creator_share_bps, 7_000, "no record: 70%, never the new 60% default");
         ctx("owner.near", 0);
         assert_eq!(f.backfill_fee_opts(vec![U64(old), U64(custom), U64(99)]), 1);
-        assert_eq!(f.get_fee_opts(U64(custom)).creator_share_bps, 7_000, "an existing record is untouched");
+        assert_eq!(f.get_fee_opts(U64(custom)).creator_share_bps, 6_000, "an existing record is untouched");
         assert_eq!(f.get_fee_opts(U64(old)).creator_share_bps, 7_000);
         ctx("alice.near", 0);
         assert_eq!(panics(|| { f.backfill_fee_opts(vec![U64(old)]); }), "owner only");
@@ -6929,7 +6948,7 @@ mod v6_tests {
     #[test]
     fn set_config_keeps_the_default_share_in_the_creator_band() {
         let mut f = factory();
-        for (bps, ok) in [(6_999u16, false), (7_000, true), (7_500, false), (8_000, false), (9_000, false), (10_000, false)] {
+        for (bps, ok) in [(5_999u16, false), (6_000, true), (7_000, false), (8_000, false), (9_000, false), (10_000, false)] {
             let mut c = f.config.clone();
             c.creator_fee_share_bps = bps;
             ctx("owner.near", 0);
@@ -7241,7 +7260,7 @@ mod v6_tests {
         let v = if l(&f, id).token_is_x { vec![U128(0), U128(n)] } else { vec![U128(n), U128(0)] };
         ctx_gas(ME, 12);
         assert!(f.on_fees_claimed(id, Ok(v.clone())));
-        assert_eq!(f.protocol_fees, n * 3 / 10, "booked, not paid");
+        assert_eq!(f.protocol_fees, n * 4 / 10, "booked, not paid");
         assert_eq!(logs_with("protocol_fees_split_deferred").len(), 1);
         assert!(transfers().is_empty());
 
@@ -7704,7 +7723,7 @@ mod v6_tests {
         ctx_gas(ME, 100);
         assert!(f.on_fees_claimed(id, Ok(v)));
         assert_eq!(f.get_creator_fees(acct("router.near")).0, 0, "not the per-account balance");
-        assert_eq!(transfers(), vec![("router.near".to_string(), n * 7 / 10)], "the NEAR goes as a plain transfer");
+        assert_eq!(transfers(), vec![("router.near".to_string(), n * 6 / 10)], "the NEAR goes as a plain transfer");
         assert!(calls().iter().all(|c| c.1 != "on_launch_fees"), "no notice before the transfer landed");
         assert_eq!(f.get_router_fees(U64(id)).0 .0, 0);
 
@@ -7735,7 +7754,7 @@ mod v6_tests {
         add_counter(&tax_selling_key(id), 100);
         ctx("seller.near", 1_000);
         assert!(f.tax_proceeds(U64(id), U128(100)));
-        assert_eq!(f.get_router_fees(U64(id)).0 .0, 700, "the creator's 70 % waits for the router push");
+        assert_eq!(f.get_router_fees(U64(id)).0 .0, 600, "the creator's 60 % waits for the router push");
         assert!(transfers().iter().all(|t| t.0 != "router.near"));
 
         let plain = launch(&mut f, "bob.near", "TAXP");
@@ -7744,8 +7763,8 @@ mod v6_tests {
         add_counter(&tax_selling_key(plain), 100);
         ctx("seller.near", 1_000);
         assert!(f.tax_proceeds(U64(plain), U128(100)));
-        assert_eq!(f.get_creator_fees(acct("bob.near")).0, 700);
-        assert_eq!(f.get_tax(U64(plain)).unwrap().paid_creator.0, 700);
+        assert_eq!(f.get_creator_fees(acct("bob.near")).0, 600);
+        assert_eq!(f.get_tax(U64(plain)).unwrap().paid_creator.0, 600);
     }
 
     #[test]
@@ -7839,7 +7858,7 @@ mod v6_tests {
             tax_holders_key(1), tax_burned_key(1), tax_paid_creator_key(1), tax_paid_holders_key(1), tax_paid_platform_key(1),
             tax_selling_key(1), TAX_SELLER_KEY.to_vec(),
 
-            tax_floor_key(1), wnear_owed_key(1), wnear_owed_bucket_key(1), wnear_retry_key(1), icon_len_key(1), BURN_POT_KEY.to_vec(), REFERRAL_POT_KEY.to_vec(),
+            tax_floor_key(1), wnear_owed_key(1), wnear_owed_bucket_key(1), wnear_retry_key(1), icon_len_key(1), HOLDERS_POT_KEY.to_vec(), REFERRAL_POT_KEY.to_vec(),
 
             dev_buy_out_key(1), RELAYERS_KEY.to_vec(), swap_lock_key(&a), PENDING_OWNER_KEY.to_vec(),
             FEE_ROUTERS_KEY.to_vec(), LAUNCH_HOOK_KEY.to_vec(), DCLS_KEY.to_vec(), router_near_key(1),
@@ -8065,12 +8084,28 @@ mod v6_tests {
     }
 
     #[test]
-    fn migrate_is_a_private_no_op() {
-        let f = factory();
-        let before = f.get_config();
+    fn migrate_sets_the_60_share_and_the_holders_pot_once() {
+        let mut f = factory();
+        owner();
+        f.set_protocol_recipients(vec![(acct("p1.near"), 5000), (acct("p2.near"), 5000)]);
+        f.set_referral_pot(Some(acct("refpot.near")));
+
+        f.config.creator_fee_share_bps = 7_000;
+        let old = launch(&mut f, "alice.near", "OLD");
+        env::storage_remove(&fee_opts_key(old));
         ctx(ME, 0);
         assert!(f.migrate());
-        assert_eq!(f.get_config().creator_fee_share_bps, before.creator_fee_share_bps);
+        assert_eq!(f.get_config().creator_fee_share_bps, 6_000);
+        assert_eq!(f.get_holders_pot(), Some(acct(NEARLY_HOLDERS_POT)));
+        assert_eq!(logs_with("holders_pot_set").len(), 1);
+        assert_eq!(f.get_fee_opts(U64(old)).creator_share_bps, 7_000, "an old launch keeps 70%");
+
+        ctx(ME, 0);
+        assert!(f.migrate());
+        assert!(logs_with("holders_pot_set").is_empty() && logs_with("creator_share_set").is_empty());
+        let id = launch_scheduled(&mut f, "bob.near", args("NEW"));
+        assert_eq!(fee_opts(id, 8000), (FM_CREATOR, 6000));
+        assert_eq!(f.get_launch_recipients(U64(id)).unwrap(), vec![(acct("p1.near"), 2500), (acct("p2.near"), 2500), (acct(NEARLY_HOLDERS_POT), 2500), (acct("refpot.near"), 2500)]);
 
     }
 
