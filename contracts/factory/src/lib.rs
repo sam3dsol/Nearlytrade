@@ -72,7 +72,13 @@ const LOW_FEE_TOP_POINT: i32 = 80_000;
 
 const DUST_ORDER: u128 = 1_000_000_000_000_000_000;
 const DUST_SLOT: u128 = 10_000_000_000_000_000_000_000;
-const GAS_DUST: Gas = Gas::from_tgas(25);
+
+
+
+const GAS_DUST_FTC: Gas = Gas::from_tgas(50);
+const GAS_DUST: Gas = Gas::from_tgas(5 + tg(GAS_DUST_FTC));
+
+const GAS_DUST_CB_MIN: Gas = Gas::from_tgas(15);
 const DUST_FUND_KEY: &[u8] = b"dsf";
 
 
@@ -226,6 +232,8 @@ const GAS_ADD_BUY_MARGIN: Gas = Gas::from_tgas(3);
 const _: () = assert!(tg(GAS_LIQ_CB_ADD_BUY) >= T_CB_BURN + tg(GAS_ON_SPLIT) + 2 + 3, "on_liquidity_added_buy must book the launch and its refund");
 
 const T_LOCK3_ADD: u64 = 111;
+
+const _: () = assert!(T_ON_CREATED_AT_300 - T_CB_BURN >= tg(GAS_DUST) + tg(GAS_RESERVE) + T_CB_BURN + T_LOCK3_ADD + tg(GAS_LIQ_CB) + tg(GAS_RESERVE), "the dust order and the position no longer fit a 300 TGas launch on lock3");
 const _: () = assert!(T_ON_CREATED_AT_300 >= T_LOCK3_ADD + tg(GAS_LIQ_CB_DEV_BUY) + tg(GAS_RESERVE_INLINE), "an in-line dev buy no longer fits a 300 TGas launch on lock3");
 
 
@@ -1292,6 +1300,24 @@ impl Factory {
             }
             Err(_) => self.internal_fail(id, l, "add_liquidity"),
         }
+    }
+
+
+
+
+    #[private]
+    pub fn on_dust_placed(&mut self, id: u64, inline: Option<bool>, #[callback_result] used: Result<U128, PromiseError>) -> PromiseOrValue<bool> {
+        let mut l = self.rec(id);
+        l.inflight = false;
+        if matches!(used, Ok(U128(u)) if u == DUST_ORDER) {
+            env::storage_write(&dust_key(id), &[1]);
+            let point = l.init_point - point_delta(fee_of(&l.pool_id));
+            emit("dust_order", &format!(r#"{{"id":{},"pool_id":{},"point":{},"amount":"{}"}}"#, id, js(&l.pool_id), point, DUST_ORDER));
+            return self.internal_advance(id, l, inline.unwrap_or(false));
+        }
+        emit("launch_step_parked", &format!(r#"{{"id":{},"step":"AddLiquidity","reason":"dust order refused"}}"#, id));
+        self.launches.insert(id, l);
+        PromiseOrValue::Value(false)
     }
 
 
@@ -4438,7 +4464,7 @@ impl Factory {
     fn internal_advance(&mut self, id: u64, l: Launch, inline: bool) -> PromiseOrValue<bool> {
         let need = step_gas(l.step).saturating_add(step_cb_gas(l.step)).saturating_add(GAS_RESERVE);
 
-        let need = if l.step == Step::AddLiquidity { need.saturating_add(self.dust_gas(&l)) } else { need };
+        let need = if l.step == Step::AddLiquidity { self.add_floor(id, &l).saturating_add(step_cb_gas(l.step)).saturating_add(GAS_RESERVE) } else { need };
         if l.step == Step::DevBuy {
             let reason = if gas_left() < DevBuyBudget::INLINE.need(self.wnear_registered) {
                 Some("not enough gas for the swap in this transaction")
@@ -4452,6 +4478,15 @@ impl Factory {
             }
             return PromiseOrValue::Promise(self.internal_dev_buy(id, l, DevBuyBudget::INLINE));
         }
+        if l.step == Step::AddLiquidity && self.dust_pending(id, &l) {
+
+            if gas_left() < GAS_DUST.saturating_add(GAS_DUST_CB_MIN).saturating_add(GAS_RESERVE) {
+                emit("launch_step_parked", &format!(r#"{{"id":{},"step":"AddLiquidity","reason":"dust order"}}"#, id));
+                self.launches.insert(id, l);
+                return PromiseOrValue::Value(true);
+            }
+            return PromiseOrValue::Promise(self.send_dust(id, l, inline));
+        }
         if l.step == Step::AddLiquidity {
 
 
@@ -4461,7 +4496,7 @@ impl Factory {
                     Some("paused")
                 } else if !inline && !self.may_trigger_dev_buy(&l) {
                     Some("first buy: resume by the creator, the owner or a relayer")
-                } else if gas_left() < GAS_ADD_BUY_STEP.saturating_add(self.dust_gas(&l)).saturating_add(if inline { Gas::from_tgas(0) } else { GAS_ADD_BUY_MARGIN }) {
+                } else if gas_left() < GAS_ADD_BUY_STEP.saturating_add(if inline { Gas::from_tgas(0) } else { GAS_ADD_BUY_MARGIN }) {
 
 
                     Some("first buy: resume with at least 260 TGas")
@@ -4613,7 +4648,12 @@ impl Factory {
             Step::CreatePool => self.internal_pool_batch(&l).then(ext.on_pool_created(id, Some(inline))),
             Step::AddLiquidity => {
 
-                require!(gas_left() >= GAS_LOCKER_ADD.saturating_add(GAS_LIQ_CB).saturating_add(reserve).saturating_add(self.dust_gas(&l)), "attach more gas: adding liquidity needs 300 TGas");
+                if self.dust_pending(id, &l) {
+                    require!(gas_left() >= GAS_DUST.saturating_add(GAS_DUST_CB_MIN).saturating_add(reserve), "attach more gas: the dust order needs 100 TGas");
+                    return self.send_dust(id, l, inline);
+                }
+
+                require!(gas_left() >= self.add_floor(id, &l).saturating_add(GAS_LIQ_CB).saturating_add(reserve), "attach more gas: adding liquidity needs 300 TGas");
 
                 let (ax, ay) = if l.token_is_x { (l.total_supply.0, 0u128) } else { (0u128, l.total_supply.0) };
 
@@ -4635,23 +4675,21 @@ impl Factory {
 
                 let first_buy = self.first_buy_by_locker(id, &l);
                 env::storage_remove(&no_add_key(id));
-                if first_buy && gas_left() >= GAS_ADD_BUY_STEP.saturating_add(self.dust_gas(&l)) {
+                if first_buy && gas_left() >= GAS_ADD_BUY_STEP {
                     l.dev_buy_held = U128(0);
                     self.launches.insert(id, l.clone());
                     let buy = format!(r#"{{"amount":"{}","msg":{}}}"#, l.dev_buy_near.0, js(&self.dev_buy_swap_msg(&l)));
-
                     let add_buy = Promise::new(locker)
                         .function_call("add_buy".to_string(), format!(r#"{{"args":{},"buy":{}}}"#, add_args, buy).into_bytes(), NearToken::from_yoctonear(l.dev_buy_near.0), Gas::from_tgas(T_LOCKER_ADD_BUY));
-                    return self.with_dust(&l, add_buy)
+                    return add_buy
                         .then(Self::ext(me.clone()).with_static_gas(GAS_LIQ_CB_ADD_BUY).with_unused_gas_weight(0).on_liquidity_added_buy(id));
                 }
                 let (cb, add_gas) = match locker_add_gas(&locker) {
-                    Some(lg) if dev_buy_next && gas_left() >= lg.saturating_add(GAS_LIQ_CB_DEV_BUY).saturating_add(GAS_RESERVE_INLINE).saturating_add(self.dust_gas(&l)) => (GAS_LIQ_CB_DEV_BUY, lg),
-                    _ => (GAS_LIQ_CB, gas_left().saturating_sub(reserve).saturating_sub(GAS_LIQ_CB).saturating_sub(self.dust_gas(&l)).max(GAS_LOCKER_ADD)),
+                    Some(lg) if dev_buy_next && gas_left() >= lg.saturating_add(GAS_LIQ_CB_DEV_BUY).saturating_add(GAS_RESERVE_INLINE) => (GAS_LIQ_CB_DEV_BUY, lg),
+                    _ => (GAS_LIQ_CB, gas_left().saturating_sub(reserve).saturating_sub(GAS_LIQ_CB).max(self.add_floor(id, &l))),
                 };
-
                 let add = Promise::new(locker).function_call("add".to_string(), format!(r#"{{"args":{}}}"#, add_args).into_bytes(), NO_DEPOSIT, add_gas);
-                self.with_dust(&l, add)
+                add
                     .then(Self::ext(me.clone()).with_static_gas(cb).on_liquidity_added(id, Some(inline)))
             }
             Step::DevBuy => unreachable!("handled above"),
@@ -4661,24 +4699,35 @@ impl Factory {
     }
 
 
-    fn dust_gas(&self, l: &Launch) -> Gas {
-        if needs_dust(fee_of(&l.pool_id)) && l.lpt_id.is_none() { GAS_DUST } else { Gas::from_tgas(0) }
+    fn dust_pending(&self, id: u64, l: &Launch) -> bool {
+        needs_dust(fee_of(&l.pool_id)) && l.lpt_id.is_none() && !env::storage_has_key(&dust_key(id))
     }
 
 
 
-    fn with_dust(&self, l: &Launch, next: Promise) -> Promise {
-        if self.dust_gas(l) == Gas::from_tgas(0) {
-            return next;
-        }
+    fn add_floor(&self, id: u64, l: &Launch) -> Gas {
+        if needs_dust(fee_of(&l.pool_id)) { locker_add_gas(&self.locker_for(id)).unwrap_or(GAS_LOCKER_ADD) } else { GAS_LOCKER_ADD }
+    }
+
+
+
+    fn send_dust(&mut self, id: u64, mut l: Launch, inline: bool) -> Promise {
+        l.inflight = true;
+        self.launches.insert(id, l.clone());
+        let me = env::current_account_id();
         let point = l.init_point - point_delta(fee_of(&l.pool_id));
         let order = format!(r#"{{"LimitOrder":{{"client_id":"","pool_id":{},"buy_token":"{}","point":{}}}}}"#, js(&l.pool_id), l.token, point);
-        let args = format!(r#"{{"receiver_id":"{}","amount":"{}","msg":{}}}"#, self.dcl_for(l.id), DUST_ORDER, js(&order));
-        emit("dust_order", &format!(r#"{{"id":{},"pool_id":{},"point":{},"amount":"{}"}}"#, l.id, js(&l.pool_id), point, DUST_ORDER));
-        Promise::new(self.wnear_id.clone())
-            .function_call("near_deposit".to_string(), b"{}".to_vec(), NearToken::from_yoctonear(DUST_ORDER), Gas::from_tgas(5))
-            .function_call("ft_transfer_call".to_string(), args.into_bytes(), NearToken::from_yoctonear(1), Gas::from_tgas(20))
-            .then(next)
+        let args = format!(r#"{{"receiver_id":"{}","amount":"{}","msg":{}}}"#, self.dcl_for(id), DUST_ORDER, js(&order));
+        let mut p = Promise::new(self.wnear_id.clone());
+        let mut spent = GAS_DUST.saturating_add(GAS_RESERVE);
+        if !self.wnear_registered {
+            p = p.function_call("storage_deposit".to_string(), reg_args(&me), FT_STORAGE_REG, Gas::from_tgas(5));
+            spent = spent.saturating_add(Gas::from_tgas(5));
+        }
+        let cb = gas_left().saturating_sub(spent).max(GAS_DUST_CB_MIN);
+        p.function_call("near_deposit".to_string(), b"{}".to_vec(), NearToken::from_yoctonear(DUST_ORDER), Gas::from_tgas(5))
+            .function_call("ft_transfer_call".to_string(), args.into_bytes(), ONE_YOCTO, GAS_DUST_FTC)
+            .then(Self::ext(me).with_static_gas(cb).with_unused_gas_weight(0).on_dust_placed(id, Some(inline)))
     }
 
 
@@ -10034,6 +10083,8 @@ fn take_owed(asset: &str, a: &AccountId) -> u128 {
 fn no_add_key(id: u64) -> Vec<u8> { [b"na:".as_slice(), &id.to_le_bytes()].concat() }
 fn no_add_sent(id: u64) -> bool { env::storage_has_key(&no_add_key(id)) }
 
+fn dust_key(id: u64) -> Vec<u8> { [b"do:".as_slice(), &id.to_le_bytes()].concat() }
+
 fn unwrap_pending_key(id: u64) -> Vec<u8> { [b"uw:".as_slice(), &id.to_le_bytes()].concat() }
 
 const UW_TOTAL_KEY: &[u8] = b"uwt";
@@ -10329,7 +10380,7 @@ mod fee01_tests {
 #[cfg(test)]
 mod fee01b_tests {
     use super::*;
-    use super::v6_tests::{args, calls, ctx, factory, l, launch_with};
+    use super::v6_tests::{args, calls, ctx, ctx_gas, factory, l, launch_with};
     use near_sdk::test_utils::get_logs;
 
     fn add_step(f: &mut Factory, id: u64) {
@@ -10397,20 +10448,120 @@ mod fee01b_tests {
         }
     }
 
+
+    fn tgas_of(method: &str) -> Vec<u64> {
+        near_sdk::test_utils::get_created_receipts().iter().flat_map(|r| r.actions.iter().filter_map(|a| match a {
+            near_sdk::mock::MockAction::FunctionCallWeight { method_name, prepaid_gas, .. } if method_name == method.as_bytes() => Some(prepaid_gas.as_gas() / 1_000_000_000_000),
+            _ => None,
+        }).collect::<Vec<_>>()).collect()
+    }
+
     #[test]
-    fn the_dust_order_goes_out_before_the_locker_add() {
+    fn the_dust_order_goes_out_on_its_own_first() {
+        for (fee, d) in [(400u32, 8), (100, 1)] {
+            let mut f = factory();
+
+            let fund0 = f.get_dust_fund().0;
+            let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: Some(fee), ..args("CAT") });
+            assert_eq!(f.get_dust_fund().0, fund0 + DUST_SLOT, "the creator's slot waits in the fund");
+            add_step(&mut f, id);
+            let x = l(&f, id);
+            let c = calls();
+            let dep = c.iter().position(|c| c.0 == "wrap.near" && c.1 == "near_deposit" && c.3 == DUST_ORDER).expect("near_deposit of the dust");
+            let ord = c.iter().position(|c| c.0 == "wrap.near" && c.1 == "ft_transfer_call" && c.2.contains("LimitOrder") && c.2.contains(&format!("\\\"point\\\":{}", x.init_point - d))).expect("the LimitOrder one grid step under the start");
+            assert!(dep < ord);
+            assert!(c[ord].2.contains(&x.token.to_string()) && c[ord].2.contains("dclv2.ref-labs.near"));
+            assert!(!c.iter().any(|c| c.1 == "add" || c.1 == "add_buy"), "fee {}: the add waits for the order", fee);
+            assert_eq!(tgas_of("ft_transfer_call"), vec![50], "wrap.near keeps 30 of it");
+            assert!(x.inflight && x.step == Step::AddLiquidity);
+            assert!(!get_logs().iter().any(|g| g.contains("\"event\":\"dust_order\"")), "booked only once placed");
+        }
+    }
+
+    #[test]
+    fn a_placed_dust_order_lets_the_add_go_out() {
         let mut f = factory();
         let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: Some(100), ..args("CAT") });
-        assert_eq!(f.get_dust_fund().0, DUST_SLOT, "the creator's slot waits in the fund");
         add_step(&mut f, id);
-        let x = l(&f, id);
+        ctx_gas("nearlytrade.near", 300);
+        drop(f.on_dust_placed(id, Some(true), Ok(U128(DUST_ORDER))));
+        assert!(env::storage_has_key(&dust_key(id)));
+        assert!(get_logs().iter().any(|g| g.contains("\"event\":\"dust_order\"")));
         let c = calls();
-        let dep = c.iter().position(|c| c.0 == "wrap.near" && c.1 == "near_deposit" && c.3 == DUST_ORDER).expect("near_deposit of the dust");
-        let ord = c.iter().position(|c| c.0 == "wrap.near" && c.1 == "ft_transfer_call" && c.2.contains("LimitOrder") && c.2.contains(&format!("\\\"point\\\":{}", x.init_point - 1))).expect("the LimitOrder one point under the start");
-        let add = c.iter().position(|c| c.1 == "add").expect("the locker add");
-        assert!(dep < ord && ord < add, "{:?}", c.iter().map(|c| (&c.0, &c.1)).collect::<Vec<_>>());
-        assert!(c[ord].2.contains(&x.token.to_string()) && c[ord].2.contains("dclv2.ref-labs.near"));
-        assert!(get_logs().iter().any(|g| g.contains("dust_order")));
+        assert!(c.iter().any(|c| c.1 == "add"), "the locker add follows");
+        assert!(!c.iter().any(|c| c.2.contains("LimitOrder")), "no second order");
+        assert!(l(&f, id).inflight);
+    }
+
+    #[test]
+    fn the_add_after_the_order_runs_on_the_lockers_measured_gas() {
+        let mut f = factory();
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: Some(100), ..args("CAT") });
+        let locker = f.locker_for(id);
+        env::storage_write(&locker_add_gas_key(&locker), &111u64.to_le_bytes());
+        add_step(&mut f, id);
+
+        ctx_gas("nearlytrade.near", 182);
+        drop(f.on_dust_placed(id, Some(true), Ok(U128(DUST_ORDER))));
+        let add = tgas_of("add");
+        assert_eq!(add.len(), 1, "the add goes out in the launch transaction: {:?}", get_logs());
+        assert!(add[0] >= 111 && add[0] < 180, "{:?}", add);
+    }
+
+    #[test]
+    fn a_refused_dust_order_parks_and_resume_sends_it_again() {
+        let mut f = factory();
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: Some(100), ..args("CAT") });
+        add_step(&mut f, id);
+        ctx_gas("nearlytrade.near", 300);
+        drop(f.on_dust_placed(id, Some(true), Ok(U128(0))));
+        let x = l(&f, id);
+        assert!(!x.inflight && x.step == Step::AddLiquidity && x.lpt_id.is_none());
+        assert!(!env::storage_has_key(&dust_key(id)));
+        assert!(get_logs().iter().any(|g| g.contains("dust order refused")));
+        assert!(!calls().iter().any(|c| c.1 == "add"));
+        ctx("anyone.near", 0);
+        drop(f.resume(U64(id)));
+        let c = calls();
+        assert!(c.iter().any(|c| c.1 == "ft_transfer_call" && c.2.contains("LimitOrder")), "the order again");
+        assert!(!c.iter().any(|c| c.1 == "add"));
+    }
+
+    #[test]
+    fn once_placed_a_resume_goes_straight_to_the_add() {
+        let mut f = factory();
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: Some(400), ..args("CAT") });
+        add_step(&mut f, id);
+        ctx_gas("nearlytrade.near", 300);
+        drop(f.on_dust_placed(id, Some(true), Ok(U128(DUST_ORDER))));
+
+        drop(f.on_liquidity_added(id, Some(true), Ok(String::new())));
+        ctx("anyone.near", 0);
+        drop(f.resume(U64(id)));
+        let c = calls();
+        assert!(c.iter().any(|c| c.1 == "add"));
+        assert!(!c.iter().any(|c| c.2.contains("LimitOrder")), "the order is placed once");
+    }
+
+    #[test]
+    fn a_first_buy_that_no_longer_fits_waits_for_the_creators_resume() {
+        let mut f = factory();
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: Some(100), dev_buy: Some(U128(10u128.pow(23))), ..args("CAT") });
+        let locker = f.locker_for(id);
+        env::storage_write(&locker_add_buy_key(&locker), &[1]);
+        assert!(f.first_buy_by_locker(id, &l(&f, id)) || !no_add_sent(id), "set up for add_buy");
+        add_step(&mut f, id);
+        ctx_gas("nearlytrade.near", 182);
+        drop(f.on_dust_placed(id, Some(true), Ok(U128(DUST_ORDER))));
+        assert!(!calls().iter().any(|c| c.1 == "add" || c.1 == "add_buy"), "nothing goes out short");
+        assert!(get_logs().iter().any(|g| g.contains("first buy: resume")), "{:?}", get_logs());
+        let x = l(&f, id);
+        assert!(!x.inflight && x.step == Step::AddLiquidity && x.dev_buy_held.0 == x.dev_buy_near.0);
+        ctx("alice.near", 0);
+        drop(f.resume(U64(id)));
+        let c = calls();
+        assert!(c.iter().any(|c| c.1 == "add_buy"), "the first buy goes out with the position");
+        assert!(!c.iter().any(|c| c.2.contains("LimitOrder")));
     }
 
     #[test]
