@@ -61,6 +61,33 @@ const NO_DEPOSIT: NearToken = NearToken::from_yoctonear(0);
 
 const POINT_DELTA_1PCT: i32 = 200;
 
+
+const LAUNCH_FEES: [u32; 4] = [10_000, 2_000, 400, 100];
+
+
+const LOW_FEE_TOP_POINT: i32 = 80_000;
+
+
+
+
+const DUST_ORDER: u128 = 1_000_000_000_000_000_000;
+const DUST_SLOT: u128 = 10_000_000_000_000_000_000_000;
+const GAS_DUST: Gas = Gas::from_tgas(25);
+const DUST_FUND_KEY: &[u8] = b"dsf";
+
+
+const DCL_SELF_STORAGE: u128 = 1_000_000_000_000_000_000_000_000;
+const FEE02_KEY: &[u8] = b"fee2";
+fn needs_dust(fee: u32) -> bool {
+    fee <= 400
+}
+fn point_delta(fee: u32) -> i32 {
+    match fee { 100 => 1, 400 => 8, 2000 => 40, _ => POINT_DELTA_1PCT }
+}
+fn fee_of(pool_id: &str) -> u32 {
+    pool_id.rsplit('|').next().and_then(|f| f.parse().ok()).unwrap_or(10_000)
+}
+
 const ONE_0001_FP: u128 = 1_000_100_000_000_000_000;
 const FP: u128 = 1_000_000_000_000_000_000;
 
@@ -474,6 +501,9 @@ pub struct LaunchArgs {
 
 
     pub holders_paid_in: Option<String>,
+
+
+    pub pool_fee: Option<u32>,
 }
 
 
@@ -571,6 +601,8 @@ pub struct LaunchCost {
     pub pool_create: U128,
     pub dcl_storage: U128,
     pub dev_buy: U128,
+
+    pub floor_order: U128,
     pub total: U128,
 }
 
@@ -849,7 +881,11 @@ impl Factory {
 
 
         let init_x = args.init_point.unwrap_or(q.init_point).clamp(q.min_init_point, q.max_init_point);
-        let init_x = floor_to(init_x, POINT_DELTA_1PCT);
+
+        let fee = args.pool_fee.unwrap_or(self.config.pool_fee);
+        require!(LAUNCH_FEES.contains(&fee), "pool_fee: 10000 (1%), 2000 (0.2%), 400 (0.04%) or 100 (0.01%)");
+        let delta = point_delta(fee);
+        let init_x = floor_to(init_x, delta);
 
 
 
@@ -860,7 +896,7 @@ impl Factory {
 
 
         let cap = if requested == 0 { 0 } else {
-            dev_buy_cap_yocto(init_x + POINT_DELTA_1PCT, self.config.total_supply.0, self.config.max_dev_buy_bps, self.config.pool_fee)
+            dev_buy_cap_yocto(init_x + delta, self.config.total_supply.0, self.config.max_dev_buy_bps, fee)
         };
         let (dev_buy, dev_buy_exact) = if requested == 0 {
             (0, false)
@@ -878,13 +914,17 @@ impl Factory {
         } else if dev_buy_exact {
             self.config.total_supply.0 / BPS * self.config.max_dev_buy_bps as u128
         } else {
-            mul_div(dev_buy_tokens_out(init_x + POINT_DELTA_1PCT, self.config.total_supply.0, dev_buy, self.config.pool_fee), DEV_BUY_MIN_OUT_BPS, BPS)
+            mul_div(dev_buy_tokens_out(init_x + delta, self.config.total_supply.0, dev_buy, fee), DEV_BUY_MIN_OUT_BPS, BPS)
         };
         let links_len = [&links.website, &links.twitter, &links.telegram].into_iter().flatten().map(|l| l.len()).sum::<usize>();
         let fronted = self.pool_fronted();
         let icon_stored = args.icon.as_ref().map(|i| json_len(i)).unwrap_or(0);
-        let cost = self.internal_cost(icon_stored, json_len(&name) + symbol.len(), name.len() + symbol.len() + description.len() + links_len, dev_buy, tax.is_some(), fronted);
+        let cost = self.internal_cost(icon_stored, json_len(&name) + symbol.len(), name.len() + symbol.len() + description.len() + links_len, dev_buy, tax.is_some(), fronted, needs_dust(fee));
         require!(deposit >= cost.total.0, "attached deposit below quote_launch(...).total");
+
+        if needs_dust(fee) {
+            add_counter(DUST_FUND_KEY, DUST_SLOT);
+        }
 
 
         let extra = deposit - cost.total.0;
@@ -911,14 +951,20 @@ impl Factory {
 
 
         let token_is_x = token.as_str() < quote_id.as_str();
+
+        require!(fee == 10_000 || (q.native && token_is_x), "pool_fee under 1%: NEAR pair only, for a ticker whose account sorts before wrap.near");
+
+        require!(fee == 10_000 || tax.is_none(), "pool_fee under 1%: no tax");
         let (a, b) = if token_is_x { (&token, &quote_id) } else { (&quote_id, &token) };
-        let pool_id = format!("{}|{}|{}", a, b, self.config.pool_fee);
+        let pool_id = format!("{}|{}|{}", a, b, fee);
         let top = (init_x.saturating_add(q.range_points)).min(POINT_MAX);
-        require!(top - init_x >= POINT_DELTA_1PCT * 2, "pair's range_points is too small to open a position");
+
+        let top = if fee == 10_000 { top } else { top.min(LOW_FEE_TOP_POINT) };
+        require!(top - init_x >= delta * 2, "pair's range_points is too small to open a position");
         let (init_point, left_point, right_point) = if token_is_x {
-            (init_x, init_x + POINT_DELTA_1PCT, top)
+            (init_x, init_x + delta, top)
         } else {
-            (-init_x, -top, -init_x - POINT_DELTA_1PCT)
+            (-init_x, -top, -init_x - delta)
         };
 
         let l = Launch {
@@ -2769,7 +2815,9 @@ impl Factory {
         self.assert_owner();
         let mut l = self.rec(launch_id.0);
         require!(l.lpt_id.is_none() && l.step != Step::Done, "liquidity already placed");
-        require!(left_point < right_point && left_point % POINT_DELTA_1PCT == 0 && right_point % POINT_DELTA_1PCT == 0, "points must be multiples of 200");
+
+        let d = point_delta(fee_of(&l.pool_id));
+        require!(left_point < right_point && left_point % d == 0 && right_point % d == 0, "points must be on the pool's grid");
         require!(!dev_buy_inflight(&l), "a dev buy's in-flight flag is only cleared by its own callback");
         l.left_point = left_point;
         l.right_point = right_point;
@@ -2856,9 +2904,12 @@ impl Factory {
 
 
 
-    pub fn quote_launch(&self, icon_bytes: u32, dev_buy: Option<U128>, tax: Option<bool>, text_bytes: Option<u32>) -> LaunchCost {
+
+    pub fn quote_launch(&self, icon_bytes: u32, dev_buy: Option<U128>, tax: Option<bool>, text_bytes: Option<u32>, pool_fee: Option<u32>) -> LaunchCost {
+        let fee = pool_fee.unwrap_or(self.config.pool_fee);
+        require!(LAUNCH_FEES.contains(&fee), "pool_fee: 10000 (1%), 2000 (0.2%), 400 (0.04%) or 100 (0.01%)");
         let record_text = text_bytes.map(|t| (t as usize).min(MAX_TEXT_BYTES + MAX_LINKS_BYTES)).unwrap_or(MAX_TEXT_BYTES + MAX_LINKS_BYTES);
-        self.internal_cost(icon_bytes as usize, MAX_TOKEN_TEXT_BYTES, record_text, dev_buy.map(|d| d.0).unwrap_or(0), tax.unwrap_or(false), self.pool_fronted())
+        self.internal_cost(icon_bytes as usize, MAX_TOKEN_TEXT_BYTES, record_text, dev_buy.map(|d| d.0).unwrap_or(0), tax.unwrap_or(false), self.pool_fronted(), needs_dust(fee))
     }
 
     pub fn get_config(&self) -> Config {
@@ -2867,8 +2918,11 @@ impl Factory {
 
 
 
-    pub fn get_dev_buy_cap(&self) -> U128 {
-        U128(dev_buy_cap_yocto(self.config.init_point + POINT_DELTA_1PCT, self.config.total_supply.0, self.config.max_dev_buy_bps, self.config.pool_fee))
+
+    pub fn get_dev_buy_cap(&self, pool_fee: Option<u32>) -> U128 {
+        let fee = pool_fee.unwrap_or(self.config.pool_fee);
+        require!(LAUNCH_FEES.contains(&fee), "pool_fee: 10000 (1%), 2000 (0.2%), 400 (0.04%) or 100 (0.01%)");
+        U128(dev_buy_cap_yocto(self.config.init_point + point_delta(fee), self.config.total_supply.0, self.config.max_dev_buy_bps, fee))
     }
 
     pub fn get_creator_fees(&self, account_id: AccountId) -> U128 {
@@ -3263,6 +3317,32 @@ impl Factory {
 
 
 
+    pub fn top_up_dcl_slots(&mut self) -> Promise {
+        let amount = read_counter(DUST_FUND_KEY);
+        require!(amount > 0, "no order-slot payments to move");
+        env::storage_remove(DUST_FUND_KEY);
+        let me = env::current_account_id();
+        Promise::new(self.dcl_for(self.next_id))
+            .function_call("storage_deposit".to_string(), format!(r#"{{"account_id":"{}","registration_only":false}}"#, me).into_bytes(), NearToken::from_yoctonear(amount), Gas::from_tgas(10))
+            .then(Self::ext(me).with_static_gas(Gas::from_tgas(5)).with_unused_gas_weight(0).on_slots_topped_up(U128(amount)))
+    }
+
+    #[private]
+    pub fn on_slots_topped_up(&mut self, amount: U128, #[callback_result] r: Result<near_sdk::serde_json::Value, PromiseError>) -> bool {
+        if r.is_err() {
+            add_counter(DUST_FUND_KEY, amount.0);
+            return false;
+        }
+        emit("dcl_slots_topped_up", &format!(r#"{{"amount":"{}"}}"#, amount.0));
+        true
+    }
+
+    pub fn get_dust_fund(&self) -> U128 {
+        U128(read_counter(DUST_FUND_KEY))
+    }
+
+
+
 
     #[payable]
     pub fn fund_locker_reserve(&mut self) -> U128 {
@@ -3411,6 +3491,14 @@ impl Factory {
             self.assert_pot_legs_fit(self.protocol_recipients.len(), true, referral_pot().is_some());
             env::storage_write(HOLDERS_POT_KEY, pot.as_bytes());
             emit("holders_pot_set", &format!(r#"{{"account":"{}"}}"#, pot));
+        }
+
+        if env::storage_read(FEE02_KEY).is_none() {
+            env::storage_write(FEE02_KEY, &[1]);
+            emit("dcl_self_storage", &format!(r#"{{"amount":"{}"}}"#, DCL_SELF_STORAGE));
+            Promise::new(self.dcl_for(self.next_id))
+                .function_call("storage_deposit".to_string(), format!(r#"{{"account_id":"{}","registration_only":false}}"#, env::current_account_id()).into_bytes(), NearToken::from_yoctonear(DCL_SELF_STORAGE), Gas::from_tgas(10))
+                .detach();
         }
         true
     }
@@ -4019,7 +4107,9 @@ impl Factory {
             return 0;
         }
         let init_x = if l.token_is_x { l.init_point } else { -l.init_point };
-        mul_div(dev_buy_tokens_out(init_x + POINT_DELTA_1PCT, l.total_supply.0, l.dev_buy_near.0, self.config.pool_fee), DEV_BUY_MIN_OUT_BPS, BPS)
+
+        let fee = fee_of(&l.pool_id);
+        mul_div(dev_buy_tokens_out(init_x + point_delta(fee), l.total_supply.0, l.dev_buy_near.0, fee), DEV_BUY_MIN_OUT_BPS, BPS)
     }
 
 
@@ -4225,7 +4315,8 @@ impl Factory {
 
 
 
-    fn internal_cost(&self, icon_len: usize, token_text: usize, record_text: usize, dev_buy: u128, tax: bool, fronted: bool) -> LaunchCost {
+    fn internal_cost(&self, icon_len: usize, token_text: usize, record_text: usize, dev_buy: u128, tax: bool, fronted: bool, dust: bool) -> LaunchCost {
+        let floor_order = if dust { DUST_ORDER + DUST_SLOT } else { 0 };
         let token_storage = self.token_storage_of(icon_len, token_text, tax);
         let record_storage = (RECORD_BASE_BYTES + record_text as u128) * STORAGE_PRICE_PER_BYTE;
         let pool_create = if fronted { DCL_POOL_CHARGE } else { DCL_POOL_CREATE }.as_yoctonear();
@@ -4238,7 +4329,8 @@ impl Factory {
             pool_create: U128(pool_create),
             dcl_storage: U128(dcl_storage),
             dev_buy: U128(dev),
-            total: U128(self.config.launch_fee.0 + token_storage + record_storage + pool_create + dcl_storage + dev),
+            floor_order: U128(floor_order),
+            total: U128(self.config.launch_fee.0 + token_storage + record_storage + pool_create + dcl_storage + dev + floor_order),
         }
     }
 
@@ -4345,6 +4437,8 @@ impl Factory {
 
     fn internal_advance(&mut self, id: u64, l: Launch, inline: bool) -> PromiseOrValue<bool> {
         let need = step_gas(l.step).saturating_add(step_cb_gas(l.step)).saturating_add(GAS_RESERVE);
+
+        let need = if l.step == Step::AddLiquidity { need.saturating_add(self.dust_gas(&l)) } else { need };
         if l.step == Step::DevBuy {
             let reason = if gas_left() < DevBuyBudget::INLINE.need(self.wnear_registered) {
                 Some("not enough gas for the swap in this transaction")
@@ -4367,7 +4461,7 @@ impl Factory {
                     Some("paused")
                 } else if !inline && !self.may_trigger_dev_buy(&l) {
                     Some("first buy: resume by the creator, the owner or a relayer")
-                } else if gas_left() < GAS_ADD_BUY_STEP.saturating_add(if inline { Gas::from_tgas(0) } else { GAS_ADD_BUY_MARGIN }) {
+                } else if gas_left() < GAS_ADD_BUY_STEP.saturating_add(self.dust_gas(&l)).saturating_add(if inline { Gas::from_tgas(0) } else { GAS_ADD_BUY_MARGIN }) {
 
 
                     Some("first buy: resume with at least 260 TGas")
@@ -4519,7 +4613,7 @@ impl Factory {
             Step::CreatePool => self.internal_pool_batch(&l).then(ext.on_pool_created(id, Some(inline))),
             Step::AddLiquidity => {
 
-                require!(gas_left() >= GAS_LOCKER_ADD.saturating_add(GAS_LIQ_CB).saturating_add(reserve), "attach more gas: adding liquidity needs 300 TGas");
+                require!(gas_left() >= GAS_LOCKER_ADD.saturating_add(GAS_LIQ_CB).saturating_add(reserve).saturating_add(self.dust_gas(&l)), "attach more gas: adding liquidity needs 300 TGas");
 
                 let (ax, ay) = if l.token_is_x { (l.total_supply.0, 0u128) } else { (0u128, l.total_supply.0) };
 
@@ -4541,26 +4635,50 @@ impl Factory {
 
                 let first_buy = self.first_buy_by_locker(id, &l);
                 env::storage_remove(&no_add_key(id));
-                if first_buy && gas_left() >= GAS_ADD_BUY_STEP {
+                if first_buy && gas_left() >= GAS_ADD_BUY_STEP.saturating_add(self.dust_gas(&l)) {
                     l.dev_buy_held = U128(0);
                     self.launches.insert(id, l.clone());
                     let buy = format!(r#"{{"amount":"{}","msg":{}}}"#, l.dev_buy_near.0, js(&self.dev_buy_swap_msg(&l)));
-                    return Promise::new(locker)
-                        .function_call("add_buy".to_string(), format!(r#"{{"args":{},"buy":{}}}"#, add_args, buy).into_bytes(), NearToken::from_yoctonear(l.dev_buy_near.0), Gas::from_tgas(T_LOCKER_ADD_BUY))
+
+                    let add_buy = Promise::new(locker)
+                        .function_call("add_buy".to_string(), format!(r#"{{"args":{},"buy":{}}}"#, add_args, buy).into_bytes(), NearToken::from_yoctonear(l.dev_buy_near.0), Gas::from_tgas(T_LOCKER_ADD_BUY));
+                    return self.with_dust(&l, add_buy)
                         .then(Self::ext(me.clone()).with_static_gas(GAS_LIQ_CB_ADD_BUY).with_unused_gas_weight(0).on_liquidity_added_buy(id));
                 }
                 let (cb, add_gas) = match locker_add_gas(&locker) {
-                    Some(lg) if dev_buy_next && gas_left() >= lg.saturating_add(GAS_LIQ_CB_DEV_BUY).saturating_add(GAS_RESERVE_INLINE) => (GAS_LIQ_CB_DEV_BUY, lg),
-                    _ => (GAS_LIQ_CB, gas_left().saturating_sub(reserve).saturating_sub(GAS_LIQ_CB).max(GAS_LOCKER_ADD)),
+                    Some(lg) if dev_buy_next && gas_left() >= lg.saturating_add(GAS_LIQ_CB_DEV_BUY).saturating_add(GAS_RESERVE_INLINE).saturating_add(self.dust_gas(&l)) => (GAS_LIQ_CB_DEV_BUY, lg),
+                    _ => (GAS_LIQ_CB, gas_left().saturating_sub(reserve).saturating_sub(GAS_LIQ_CB).saturating_sub(self.dust_gas(&l)).max(GAS_LOCKER_ADD)),
                 };
-                Promise::new(locker)
-                    .function_call("add".to_string(), format!(r#"{{"args":{}}}"#, add_args).into_bytes(), NO_DEPOSIT, add_gas)
+
+                let add = Promise::new(locker).function_call("add".to_string(), format!(r#"{{"args":{}}}"#, add_args).into_bytes(), NO_DEPOSIT, add_gas);
+                self.with_dust(&l, add)
                     .then(Self::ext(me.clone()).with_static_gas(cb).on_liquidity_added(id, Some(inline)))
             }
             Step::DevBuy => unreachable!("handled above"),
             Step::Deposit | Step::ReadDevTokens | Step::DeliverDevTokens => env::panic_str("dead step"),
             Step::Done | Step::Failed => env::panic_str("launch finished"),
         }
+    }
+
+
+    fn dust_gas(&self, l: &Launch) -> Gas {
+        if needs_dust(fee_of(&l.pool_id)) && l.lpt_id.is_none() { GAS_DUST } else { Gas::from_tgas(0) }
+    }
+
+
+
+    fn with_dust(&self, l: &Launch, next: Promise) -> Promise {
+        if self.dust_gas(l) == Gas::from_tgas(0) {
+            return next;
+        }
+        let point = l.init_point - point_delta(fee_of(&l.pool_id));
+        let order = format!(r#"{{"LimitOrder":{{"client_id":"","pool_id":{},"buy_token":"{}","point":{}}}}}"#, js(&l.pool_id), l.token, point);
+        let args = format!(r#"{{"receiver_id":"{}","amount":"{}","msg":{}}}"#, self.dcl_for(l.id), DUST_ORDER, js(&order));
+        emit("dust_order", &format!(r#"{{"id":{},"pool_id":{},"point":{},"amount":"{}"}}"#, l.id, js(&l.pool_id), point, DUST_ORDER));
+        Promise::new(self.wnear_id.clone())
+            .function_call("near_deposit".to_string(), b"{}".to_vec(), NearToken::from_yoctonear(DUST_ORDER), Gas::from_tgas(5))
+            .function_call("ft_transfer_call".to_string(), args.into_bytes(), NearToken::from_yoctonear(1), Gas::from_tgas(20))
+            .then(next)
     }
 
 
@@ -4576,7 +4694,7 @@ impl Factory {
             )
             .function_call(
                 "create_pool".to_string(),
-                format!(r#"{{"token_a":"{}","token_b":"{}","fee":{},"init_point":{}}}"#, a, b, self.config.pool_fee, l.init_point).into_bytes(),
+                format!(r#"{{"token_a":"{}","token_b":"{}","fee":{},"init_point":{}}}"#, a, b, fee_of(&l.pool_id), l.init_point).into_bytes(),
                 DCL_POOL_CREATE,
                 GAS_DCL_POOL,
             )
@@ -4992,7 +5110,7 @@ mod tests {
             None,
         );
         let requested = 60 * 10u128.pow(24);
-        let deposit = f.quote_launch(0, Some(U128(requested)), None, None).total.0;
+        let deposit = f.quote_launch(0, Some(U128(requested)), None, None, None).total.0;
         near_sdk::testing_env!(VMContextBuilder::new()
             .current_account_id("nearlytrade.near".parse().unwrap())
             .predecessor_account_id(creator.clone())
@@ -5000,7 +5118,7 @@ mod tests {
             .account_balance(NearToken::from_near(200))
             .prepaid_gas(Gas::from_tgas(300))
             .build());
-        let args = LaunchArgs {
+        let args = LaunchArgs { pool_fee: None,
             name: "Doomslug".into(), symbol: "DOOM".into(), icon: None, description: None, links: None,
             dev_buy: Some(U128(requested)), init_point: None, quote: None, fee_mode: None, creator_share_bps: None, tax: None, fee_to: None, creator_paid_in: None, holders_paid_in: None,
         };
@@ -5009,7 +5127,7 @@ mod tests {
         let l = f.launches.get(&0).cloned().unwrap();
         let held = l.dev_buy_held.0;
         assert!(l.dev_buy_exact && held < requested, "60 NEAR is over the 4% cap");
-        let cost = f.internal_cost(0, 12, 12, held, false, f.pool_fronted()).total.0;
+        let cost = f.internal_cost(0, 12, 12, held, false, f.pool_fronted(), false).total.0;
         let refunds: Vec<u128> = get_created_receipts().iter()
             .filter(|r| r.receiver_id == creator)
             .flat_map(|r| r.actions.iter())
@@ -5048,13 +5166,13 @@ mod fee_to_tests {
             .build());
     }
     fn args(sym: &str, fee_to: Option<&str>) -> LaunchArgs {
-        LaunchArgs {
+        LaunchArgs { pool_fee: None,
             name: sym.into(), symbol: sym.into(), icon: None, description: None, links: None, dev_buy: None, init_point: None,
             quote: None, fee_mode: None, creator_share_bps: None, tax: None, fee_to: fee_to.map(|a| a.parse().unwrap()), creator_paid_in: None, holders_paid_in: None,
         }
     }
     fn launch(f: &mut Factory, who: &str, sym: &str, fee_to: Option<&str>) -> u64 {
-        let deposit = f.quote_launch(0, None, None, None).total.0;
+        let deposit = f.quote_launch(0, None, None, None, None).total.0;
         as_caller(f, who, deposit);
         std::mem::forget(f.launch(args(sym, fee_to)));
         f.next_id - 1
@@ -5506,14 +5624,14 @@ mod v6_tests {
         fees
     }
     pub(super) fn args(sym: &str) -> LaunchArgs {
-        LaunchArgs {
+        LaunchArgs { pool_fee: None,
             name: sym.into(), symbol: sym.into(), icon: None, description: None, links: None, dev_buy: None, init_point: None,
             quote: None, fee_mode: None, creator_share_bps: None, tax: None, fee_to: None, creator_paid_in: None, holders_paid_in: None,
         }
     }
     pub(super) fn launch_with(f: &mut Factory, who: &str, a: LaunchArgs) -> u64 {
         let icon_len = a.icon.as_ref().map(|s| s.len()).unwrap_or(0) as u32;
-        let deposit = f.quote_launch(icon_len, a.dev_buy, Some(a.tax.is_some()), None).total.0;
+        let deposit = f.quote_launch(icon_len, a.dev_buy, Some(a.tax.is_some()), None, None).total.0;
         ctx(who, deposit);
         std::mem::forget(f.launch(a));
         f.next_id - 1
@@ -5579,7 +5697,7 @@ mod v6_tests {
     fn a_dev_buy_stores_its_floor_and_the_swap_uses_it() {
         let mut f = factory();
         let near = 5 * 10u128.pow(24);
-        let id = launch_with(&mut f, "alice.near", LaunchArgs { dev_buy: Some(U128(near)), ..args("FLOOR") });
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("FLOOR") });
         let stored = dev_buy_out(id).expect("stored at launch");
         let curve = dev_buy_tokens_out(POINT_DELTA_1PCT, f.config.total_supply.0, near, 10_000);
         assert_eq!(stored, curve * 9_700 / 10_000);
@@ -5592,7 +5710,7 @@ mod v6_tests {
     #[test]
     fn an_exact_dev_buy_stores_its_exact_output() {
         let mut f = factory();
-        let id = launch_with(&mut f, "alice.near", LaunchArgs { dev_buy: Some(U128(500 * 10u128.pow(24))), ..args("EXACT") });
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, dev_buy: Some(U128(500 * 10u128.pow(24))), ..args("EXACT") });
         assert!(l(&f, id).dev_buy_exact);
         assert_eq!(dev_buy_out(id), Some(f.config.total_supply.0 / BPS * 400));
     }
@@ -5601,7 +5719,7 @@ mod v6_tests {
     fn a_launch_without_a_stored_floor_gets_the_same_one_recomputed() {
         let mut f = factory();
         let near = 7 * 10u128.pow(24);
-        let id = launch_with(&mut f, "alice.near", LaunchArgs { dev_buy: Some(U128(near)), ..args("OLD") });
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("OLD") });
         let stored = dev_buy_out(id).unwrap();
         env::storage_remove(&dev_buy_out_key(id));
         assert_eq!(f.get_dev_buy_min_out(U64(id)).0, stored);
@@ -5611,7 +5729,7 @@ mod v6_tests {
     #[should_panic(expected = "dev buy: creator, owner or relayer only")]
     fn a_stranger_cannot_trigger_the_dev_buy() {
         let mut f = factory();
-        let id = launch_with(&mut f, "alice.near", LaunchArgs { dev_buy: Some(U128(10u128.pow(24))), ..args("SAND") });
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, dev_buy: Some(U128(10u128.pow(24))), ..args("SAND") });
         park(&mut f, id, Step::DevBuy);
         ctx("mallory.near", 0);
         std::mem::forget(f.resume(U64(id)));
@@ -5624,7 +5742,7 @@ mod v6_tests {
         f.set_relayers(vec!["relay.near".parse().unwrap()]);
         assert_eq!(f.get_relayers(), vec!["relay.near".parse::<AccountId>().unwrap()]);
         for who in ["relay.near", "owner.near", "alice.near"] {
-            let id = launch_with(&mut f, "alice.near", LaunchArgs { dev_buy: Some(U128(10u128.pow(24))), ..args("RELAY") });
+            let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, dev_buy: Some(U128(10u128.pow(24))), ..args("RELAY") });
             park(&mut f, id, Step::DevBuy);
             ctx(who, 0);
             std::mem::forget(f.resume(U64(id)));
@@ -5643,7 +5761,7 @@ mod v6_tests {
 
 
     fn dev_buy_launch(f: &mut Factory, near: u128) -> u64 {
-        let id = launch_with(f, "alice.near", LaunchArgs { dev_buy: Some(U128(near)), ..args("DEV") });
+        let id = launch_with(f, "alice.near", LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("DEV") });
         park(f, id, Step::DevBuy);
         id
     }
@@ -5783,7 +5901,7 @@ mod v6_tests {
     fn refund_failed_also_clears_the_buy() {
         let mut f = factory();
         let near = 2 * 10u128.pow(24);
-        let id = launch_with(&mut f, "alice.near", LaunchArgs { dev_buy: Some(U128(near)), ..args("GONE") });
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("GONE") });
         let mut lz = l(&f, id);
         lz.step = Step::Failed;
         f.launches.insert(id, lz);
@@ -5797,7 +5915,7 @@ mod v6_tests {
 
 
     pub(super) fn created_but_pool_refused(f: &mut Factory, near: u128) -> u64 {
-        let id = launch_with(f, "alice.near", LaunchArgs { dev_buy: Some(U128(near)), ..args("GRIEF") });
+        let id = launch_with(f, "alice.near", LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("GRIEF") });
         ctx(ME, 0);
         let r = f.on_created(id, None, Ok(StorageBalanceJson { total: "0".into() }), Err(PromiseError::Failed));
         assert!(matches!(r, PromiseOrValue::Promise(_)), "a refused create_pool reads the pool");
@@ -5860,8 +5978,8 @@ mod v6_tests {
         c.current_account_id(acct(ME)).predecessor_account_id(acct("alice.near")).account_balance(NearToken::from_millinear(500));
         near_sdk::testing_env!(c.build());
         assert!(!f.pool_fronted());
-        assert_eq!(f.quote_launch(0, None, None, None).pool_create.0, DCL_POOL_CREATE.as_yoctonear());
-        let q = f.quote_launch(0, None, None, None).total.0;
+        assert_eq!(f.quote_launch(0, None, None, None, None).pool_create.0, DCL_POOL_CREATE.as_yoctonear());
+        let q = f.quote_launch(0, None, None, None, None).total.0;
         c.attached_deposit(NearToken::from_yoctonear(q)).account_balance(NearToken::from_yoctonear(q + NearToken::from_millinear(500).as_yoctonear()));
         near_sdk::testing_env!(c.build());
         std::mem::forget(f.launch(args("LOWF")));
@@ -5905,7 +6023,7 @@ mod v6_tests {
     const DAY: u64 = 86_400_000;
 
     fn stuck(f: &mut Factory, step: Step, near: u128) -> u64 {
-        let id = launch_with(f, "alice.near", LaunchArgs { dev_buy: Some(U128(near)), ..args("STUCK") });
+        let id = launch_with(f, "alice.near", LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("STUCK") });
         park(f, id, step);
         id
     }
@@ -6019,7 +6137,7 @@ mod v6_tests {
     }
     fn launch_scheduled(f: &mut Factory, who: &str, a: LaunchArgs) -> u64 {
         let icon_len = a.icon.as_ref().map(|s| s.len()).unwrap_or(0) as u32;
-        let deposit = f.quote_launch(icon_len, a.dev_buy, Some(a.tax.is_some()), None).total.0;
+        let deposit = f.quote_launch(icon_len, a.dev_buy, Some(a.tax.is_some()), None, None).total.0;
         ctx(who, deposit);
         drop(f.launch(a));
         f.next_id - 1
@@ -6029,7 +6147,7 @@ mod v6_tests {
     fn the_icon_stays_in_the_factory_record_and_goes_to_the_token_as_live() {
         let mut f = factory();
         let icon = icon_of(3_000);
-        let id = launch_scheduled(&mut f, "alice.near", LaunchArgs { icon: Some(icon.clone()), ..args("ICON") });
+        let id = launch_scheduled(&mut f, "alice.near", LaunchArgs { pool_fee: None, icon: Some(icon.clone()), ..args("ICON") });
         assert_eq!(l(&f, id).icon.as_deref(), Some(icon.as_str()), "the record carries the icon until the token exists");
         let init = calls().into_iter().find(|c| c.1 == "new").expect("token init");
         assert!(init.2.contains(&icon), "the token's metadata carries the icon");
@@ -6071,14 +6189,14 @@ mod v6_tests {
         let id2 = launch_scheduled(&mut f, "alice.near", args("ONEPOT"));
         assert_eq!(f.get_launch_recipients(U64(id2)).unwrap(), vec![(acct("p1.near"), 3750), (acct("p2.near"), 3750), (acct("holders.near"), 2500)]);
 
-        ctx("bob.near", f.quote_launch(0, None, None, None).total.0);
-        assert_eq!(panics(|| drop(f.launch(LaunchArgs { creator_share_bps: Some(8000), ..args("PICK") }))), "creator_share_bps: the launchpad's current share, or leave it out");
+        ctx("bob.near", f.quote_launch(0, None, None, None, None).total.0);
+        assert_eq!(panics(|| drop(f.launch(LaunchArgs { pool_fee: None, creator_share_bps: Some(8000), ..args("PICK") }))), "creator_share_bps: the launchpad's current share, or leave it out");
 
         owner();
         f.set_referral_pot(Some(acct("refpot.near")));
         near_sdk::env::storage_write(TAX_CODE_KEY, &[7u8; 32]);
         near_sdk::env::storage_write(TAX_SELLER_KEY, b"seller.near");
-        let id3 = launch_scheduled(&mut f, "alice.near", LaunchArgs { tax: Some(TaxArgs { buy_bps: 300, sell_bps: 300, creator_bps: 5000, burn_bps: 2000, holders_bps: 3000 }), ..args("TAXN") });
+        let id3 = launch_scheduled(&mut f, "alice.near", LaunchArgs { pool_fee: None, tax: Some(TaxArgs { buy_bps: 300, sell_bps: 300, creator_bps: 5000, burn_bps: 2000, holders_bps: 3000 }), ..args("TAXN") });
         assert_eq!(tax_opts_full(id3).unwrap().1, 4000, "new tax launches carry the 40% platform cut");
         park(&mut f, id3, Step::Done);
         add_counter(&tax_selling_key(id3), 8_400);
@@ -6095,7 +6213,7 @@ mod v6_tests {
     fn a_max_size_icon_launch_fits_the_log_cap() {
         let mut f = factory();
         let icon = icon_of(f.config.max_icon_bytes as usize);
-        let id = launch_scheduled(&mut f, "alice.near", LaunchArgs {
+        let id = launch_scheduled(&mut f, "alice.near", LaunchArgs { pool_fee: None,
             icon: Some(icon.clone()), fee_mode: Some("burn".into()), creator_share_bps: Some(6000), fee_to: Some("x".repeat(64).parse().unwrap()),
             name: "\u{1F600}".repeat(32), ..args("BIGICON")
         });
@@ -6127,7 +6245,7 @@ mod v6_tests {
         }
     }
     pub(super) fn live_burn_launch(f: &mut Factory, sym: &str, bucket: u128) -> u64 {
-        let id = launch_with(f, "alice.near", LaunchArgs { fee_mode: Some("burn".into()), ..args(sym) });
+        let id = launch_with(f, "alice.near", LaunchArgs { pool_fee: None, fee_mode: Some("burn".into()), ..args(sym) });
         park(f, id, Step::Done);
         set_mode_bucket(id, bucket);
         id
@@ -6138,7 +6256,7 @@ mod v6_tests {
         acct("usdc.near")
     }
     pub(super) fn live_tax_launch(f: &mut Factory, sym: &str, quote: Option<AccountId>, pending: u128) -> u64 {
-        let id = launch_with(f, "alice.near", LaunchArgs { quote, ..args(sym) });
+        let id = launch_with(f, "alice.near", LaunchArgs { pool_fee: None, quote, ..args(sym) });
         park(f, id, Step::Done);
         set_tax_opts(id, &TaxArgs { buy_bps: 300, sell_bps: 300, creator_bps: 5000, burn_bps: 2000, holders_bps: 3000 }, 2_000);
         add_counter(&tax_pending_key(id), pending);
@@ -6280,7 +6398,7 @@ mod v6_tests {
     fn a_holders_launch_on_a_pair_banks_and_pays_its_holders_in_the_pair_token() {
         let mut f = factory();
         let usdc = usdc_pair(&mut f);
-        let id = launch_with(&mut f, "alice.near", LaunchArgs { quote: Some(usdc.clone()), fee_mode: Some("holders".into()), ..args("HPAIR") });
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, quote: Some(usdc.clone()), fee_mode: Some("holders".into()), ..args("HPAIR") });
         assert_eq!(fee_opts(id, 8000).0, FM_HOLDERS);
         let mut lz = l(&f, id);
         lz.step = Step::Done;
@@ -6311,7 +6429,7 @@ mod v6_tests {
         ctx("alice.near", 1);
         assert_eq!(panics(|| drop(f.claim_creator_quote_fees(U64(id)))), "this launch's fees go to buyback or holders");
 
-        let nid = launch_with(&mut f, "alice.near", LaunchArgs { fee_mode: Some("holders".into()), ..args("HNEAR") });
+        let nid = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, fee_mode: Some("holders".into()), ..args("HNEAR") });
         park(&mut f, nid, Step::Done);
         set_mode_bucket(nid, 1_000);
         ctx("owner.near", 0);
@@ -6325,10 +6443,10 @@ mod v6_tests {
         let usdc = usdc_pair(&mut f);
         owner();
         f.set_tax_token_code_hash(Some("11".repeat(32)));
-        let msg = panics(|| drop(launch_with(&mut f, "alice.near", LaunchArgs { quote: Some(usdc.clone()), fee_mode: Some("holders".into()), tax: Some(TaxArgs { buy_bps: 300, sell_bps: 300, creator_bps: 5000, burn_bps: 0, holders_bps: 5000 }), ..args("HTAX") })));
+        let msg = panics(|| drop(launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, quote: Some(usdc.clone()), fee_mode: Some("holders".into()), tax: Some(TaxArgs { buy_bps: 300, sell_bps: 300, creator_bps: 5000, burn_bps: 0, holders_bps: 5000 }), ..args("HTAX") })));
         assert!(msg.contains("needs fee mode creator"), "{msg}");
 
-        let id = launch_with(&mut f, "alice.near", LaunchArgs { quote: Some(usdc), fee_mode: Some("holders".into()), tax: Some(TaxArgs { buy_bps: 300, sell_bps: 300, creator_bps: 0, burn_bps: 5000, holders_bps: 5000 }), ..args("HTAX0") });
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, quote: Some(usdc), fee_mode: Some("holders".into()), tax: Some(TaxArgs { buy_bps: 300, sell_bps: 300, creator_bps: 0, burn_bps: 5000, holders_bps: 5000 }), ..args("HTAX0") });
         assert_eq!(fee_opts(id, 8000).0, FM_HOLDERS);
     }
 
@@ -6554,7 +6672,7 @@ mod v6_tests {
 
 
     fn launch_paid(f: &mut Factory, sym: &str, quote: Option<AccountId>, mode: Option<&str>, creator: Option<&str>, holders: Option<&str>) -> u64 {
-        let a = LaunchArgs { quote, fee_mode: mode.map(|m| m.to_string()), creator_paid_in: creator.map(|c| c.to_string()), holders_paid_in: holders.map(|h| h.to_string()), ..args(sym) };
+        let a = LaunchArgs { pool_fee: None, quote, fee_mode: mode.map(|m| m.to_string()), creator_paid_in: creator.map(|c| c.to_string()), holders_paid_in: holders.map(|h| h.to_string()), ..args(sym) };
         let id = launch_with(f, "alice.near", a);
         park(f, id, Step::Done);
         id
@@ -6749,7 +6867,7 @@ mod v6_tests {
         let mut f = factory();
         near_sdk::env::storage_write(TAX_SELLER_KEY, b"seller.near");
         let usdc = usdc_pair(&mut f);
-        let h = launch_with(&mut f, "alice.near", LaunchArgs { quote: Some(usdc.clone()), fee_mode: Some("holders".into()), holders_paid_in: Some("near".into()), ..args("HNR") });
+        let h = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, quote: Some(usdc.clone()), fee_mode: Some("holders".into()), holders_paid_in: Some("near".into()), ..args("HNR") });
         let mut lz = l(&f, h);
         lz.step = Step::Done;
         lz.inflight = true;
@@ -6786,7 +6904,7 @@ mod v6_tests {
         f.on_paid(U64(h), "near".into(), acct("b.near"), U128(tenth * 4 / 10), "mode".into(), false);
         assert_eq!(f.get_owed("near".into(), acct("b.near")).0, tenth * 4 / 10);
 
-        let t = launch_with(&mut f, "alice.near", LaunchArgs { quote: Some(usdc.clone()), holders_paid_in: Some("near".into()), ..args("HNT") });
+        let t = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, quote: Some(usdc.clone()), holders_paid_in: Some("near".into()), ..args("HNT") });
         park(&mut f, t, Step::Done);
         set_tax_opts(t, &TaxArgs { buy_bps: 300, sell_bps: 300, creator_bps: 5000, burn_bps: 2000, holders_bps: 3000 }, 2_000);
         add_counter(&tax_pending_key(t), 10_000);
@@ -6850,7 +6968,7 @@ mod v6_tests {
         keeper();
         f.set_tax_seller(Some(acct("seller.near")));
 
-        let h = launch_with(&mut f, "alice.near", LaunchArgs { quote: Some(usdc.clone()), fee_mode: Some("holders".into()), holders_paid_in: Some("near".into()), ..args("AFH") });
+        let h = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, quote: Some(usdc.clone()), fee_mode: Some("holders".into()), holders_paid_in: Some("near".into()), ..args("AFH") });
         park(&mut f, h, Step::Done);
         add_counter(&holders_pending_key(h, "holders"), 500);
         ctx("bob.near", 0);
@@ -6868,9 +6986,9 @@ mod v6_tests {
         assert!(sent_to("usdc.near", "c.near", 90));
         assert_eq!((f.get_fee_selling(U64(h)).holders_pending.0, mode_bucket(h)), (0, 0));
 
-        ctx("alice.near", f.quote_launch(0, None, Some(false), None).total.0);
-        assert_eq!(panics(|| drop(f.launch(LaunchArgs { fee_to: Some(acct("seller.near")), ..args("AFS") }))), "fee_to: not the tax seller (it would be paid into the wallet that sells the fees)");
-        ctx("seller.near", f.quote_launch(0, None, Some(false), None).total.0);
+        ctx("alice.near", f.quote_launch(0, None, Some(false), None, None).total.0);
+        assert_eq!(panics(|| drop(f.launch(LaunchArgs { pool_fee: None, fee_to: Some(acct("seller.near")), ..args("AFS") }))), "fee_to: not the tax seller (it would be paid into the wallet that sells the fees)");
+        ctx("seller.near", f.quote_launch(0, None, Some(false), None, None).total.0);
         assert_eq!(panics(|| drop(f.launch(args("AFT")))), "fee_to: not the tax seller (it would be paid into the wallet that sells the fees)", "nor can the seller launch and be paid");
 
         let n = launch_paid(&mut f, "AFN", None, None, None, None);
@@ -6961,10 +7079,10 @@ mod v6_tests {
         ctx(tu.as_str(), 0);
         assert!(matches!(f.ft_on_transfer(acct("seller.near"), U128(1), format!(r#"{{"fee_return":{},"share":"holders"}}"#, u)), PromiseOrValue::Value(U128(1))));
 
-        ctx("alice.near", f.quote_launch(0, None, Some(false), None).total.0);
-        assert_eq!(panics(|| drop(f.launch(LaunchArgs { creator_paid_in: Some("tokens".into()), ..args("BADC") }))), "creator_paid_in: near or pair");
-        ctx("alice.near", f.quote_launch(0, None, Some(false), None).total.0);
-        assert_eq!(panics(|| drop(f.launch(LaunchArgs { holders_paid_in: Some("usd".into()), ..args("BADH") }))), "holders_paid_in: near or pair");
+        ctx("alice.near", f.quote_launch(0, None, Some(false), None, None).total.0);
+        assert_eq!(panics(|| drop(f.launch(LaunchArgs { pool_fee: None, creator_paid_in: Some("tokens".into()), ..args("BADC") }))), "creator_paid_in: near or pair");
+        ctx("alice.near", f.quote_launch(0, None, Some(false), None, None).total.0);
+        assert_eq!(panics(|| drop(f.launch(LaunchArgs { pool_fee: None, holders_paid_in: Some("usd".into()), ..args("BADH") }))), "holders_paid_in: near or pair");
 
         keeper();
         f.set_paused(true);
@@ -7034,7 +7152,7 @@ mod v6_tests {
     fn backfill_pins_the_unrecorded_share_on_old_launches_only() {
         let mut f = factory();
         let old = launch(&mut f, "alice.near", "OLD");
-        let custom = launch_with(&mut f, "alice.near", LaunchArgs { creator_share_bps: Some(6_000), ..args("CUS") });
+        let custom = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, creator_share_bps: Some(6_000), ..args("CUS") });
         env::storage_remove(&fee_opts_key(old));
         assert_eq!(f.get_fee_opts(U64(old)).creator_share_bps, 7_000, "no record: 70%, never the new 60% default");
         ctx("owner.near", 0);
@@ -7082,7 +7200,7 @@ mod v6_tests {
     #[test]
     fn payout_batches_refuse_a_repeated_account_and_buyback_needs_a_floor() {
         let mut f = factory();
-        let id = launch_with(&mut f, "alice.near", LaunchArgs { fee_mode: Some("holders".into()), ..args("HOLD") });
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, fee_mode: Some("holders".into()), ..args("HOLD") });
         park(&mut f, id, Step::Done);
         set_mode_bucket(id, 1_000);
         ctx("owner.near", 0);
@@ -7117,7 +7235,7 @@ mod v6_tests {
         assert!(logs_with("holder_owed")[0].contains(r#""to":"gone.near","asset":"near","amount":"200""#));
         assert!(logs_with("tax_holder_pay_failed").is_empty());
 
-        let hid = launch_with(&mut f, "alice.near", LaunchArgs { fee_mode: Some("holders".into()), ..args("HMODE") });
+        let hid = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, fee_mode: Some("holders".into()), ..args("HMODE") });
         park(&mut f, hid, Step::Done);
         set_mode_bucket(hid, 100);
         ctx("owner.near", 0);
@@ -7252,7 +7370,7 @@ mod v6_tests {
         let mut f = factory();
         let usdc = usdc_pair(&mut f);
         let id = launch(&mut f, "alice.near", "SEND");
-        let qid = launch_with(&mut f, "alice.near", LaunchArgs { quote: Some(usdc.clone()), ..args("SENDQ") });
+        let qid = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, quote: Some(usdc.clone()), ..args("SENDQ") });
         for i in [id, qid] {
             park(&mut f, i, Step::Done);
             let mut lz = l(&f, i);
@@ -7776,7 +7894,7 @@ mod v6_tests {
     fn router_launch(f: &mut Factory) -> u64 {
         owner();
         f.set_fee_router(acct("router.near"), true);
-        let id = launch_with(f, "alice.near", LaunchArgs { fee_to: Some(acct("router.near")), ..args("ROUTED") });
+        let id = launch_with(f, "alice.near", LaunchArgs { pool_fee: None, fee_to: Some(acct("router.near")), ..args("ROUTED") });
         park(f, id, Step::Done);
         id
     }
@@ -7930,7 +8048,7 @@ mod v6_tests {
         owner();
         f.set_launch_hook(Some(acct("hook.near")));
         f.dcl_registered = true;
-        let id = launch_scheduled(&mut f, "alice.near", LaunchArgs { icon: Some(icon_of(16_000)), ..args("ONESHOT") });
+        let id = launch_scheduled(&mut f, "alice.near", LaunchArgs { pool_fee: None, icon: Some(icon_of(16_000)), ..args("ONESHOT") });
         let cb = static_gas_of(b"on_created").expect("on_created");
         assert!(cb >= Gas::from_tgas(tg(GAS_LOCKER_ADD) + tg(GAS_LIQ_CB) + tg(GAS_RESERVE)), "on_created gets {cb}");
         ctx_gas(ME, cb.as_gas() / 1_000_000_000_000);
@@ -8178,7 +8296,7 @@ mod v6_tests {
         drop(f.resume(U64(id)));
         assert!(static_gas_of(b"on_pool_created").unwrap() >= GAS_POOL_STEP_CB);
 
-        let deposit = f.quote_launch(0, None, None, None).total.0;
+        let deposit = f.quote_launch(0, None, None, None, None).total.0;
         ctx_full("alice.near", deposit, T0, 80);
         assert!(panics(|| std::mem::forget(f.launch(args("LOW2")))).contains("attach more gas"));
     }
@@ -8318,8 +8436,8 @@ mod v6_tests {
 
 
     fn replay_dev_buy_launch(f: &mut Factory, tgas: u64, near: u128) -> u64 {
-        let a = LaunchArgs { dev_buy: Some(U128(near)), ..args("INL") };
-        let deposit = f.quote_launch(0, a.dev_buy, None, None).total.0;
+        let a = LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("INL") };
+        let deposit = f.quote_launch(0, a.dev_buy, None, None, None).total.0;
         ctx_tx("alice.near", "alice.near", deposit, tgas);
         drop(f.launch(a));
         let id = f.next_id - 1;
@@ -8358,7 +8476,7 @@ mod v6_tests {
         let mut f = factory();
         f.wnear_registered = true;
         let near = 10u128.pow(24);
-        let id = launch_with(&mut f, "alice.near", LaunchArgs { dev_buy: Some(U128(near)), ..args("GATE") });
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("GATE") });
         let mut lz = l(&f, id);
         lz.step = Step::AddLiquidity;
         lz.inflight = true;
@@ -8421,8 +8539,8 @@ mod v6_tests {
         f.set_locker_add_gas(acct("lock.near"), T_LOCK3_ADD);
         let near = 3 * 10u128.pow(24);
 
-        let a = LaunchArgs { dev_buy: Some(U128(near)), ..args("L300") };
-        let deposit = f.quote_launch(0, a.dev_buy, None, None).total.0;
+        let a = LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("L300") };
+        let deposit = f.quote_launch(0, a.dev_buy, None, None, None).total.0;
         ctx_tx("alice.near", "alice.near", deposit, 300);
         drop(f.launch(a));
         let id = f.next_id - 1;
@@ -8456,8 +8574,8 @@ mod v6_tests {
         assert!(logs_with("launch_step_parked")[0].contains("not enough gas"));
         assert!(calls().iter().all(|c| c.1 != "ft_transfer_call"));
 
-        let a = LaunchArgs { dev_buy: Some(U128(near)), ..args("L250") };
-        let deposit = f.quote_launch(0, a.dev_buy, None, None).total.0;
+        let a = LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("L250") };
+        let deposit = f.quote_launch(0, a.dev_buy, None, None, None).total.0;
         ctx_tx("alice.near", "alice.near", deposit, 250);
         drop(f.launch(a));
         let id2 = f.next_id - 1;
@@ -8568,7 +8686,7 @@ mod v6_tests {
         let pair = l(&f, base).token.clone();
         ctx("owner.near", 0);
         f.set_quote(pair.clone(), 18, -100_000, -100_000, -100_000, 400_000, true);
-        let id = launch_with(&mut f, "bob.near", LaunchArgs { quote: Some(pair.clone()), ..args("ONP") });
+        let id = launch_with(&mut f, "bob.near", LaunchArgs { pool_fee: None, quote: Some(pair.clone()), ..args("ONP") });
         park(&mut f, id, Step::Done);
         let mut lz = l(&f, id);
         lz.lpt_id = Some("x".into());
@@ -8619,8 +8737,8 @@ mod v6_tests {
         f.set_locker_add_gas(acct("lock.near"), T_LOCK3_ADD);
         let near = 10u128.pow(24);
 
-        let a = LaunchArgs { dev_buy: Some(U128(near)), ..args("BOT") };
-        let deposit = f.quote_launch(0, a.dev_buy, None, None).total.0;
+        let a = LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("BOT") };
+        let deposit = f.quote_launch(0, a.dev_buy, None, None, None).total.0;
         ctx_tx("bot.near", "user.near", deposit, 300);
         drop(f.launch(a));
         let id = f.next_id - 1;
@@ -8634,7 +8752,7 @@ mod v6_tests {
         drop(f.on_liquidity_added(id, Some(true), Ok("pool|1".into())));
         assert!(l(&f, id).inflight && l(&f, id).dev_buy_held.0 == 0, "the buy went out in-line");
 
-        let id2 = launch_with(&mut f, "bot.near", LaunchArgs { dev_buy: Some(U128(near)), ..args("BOT2") });
+        let id2 = launch_with(&mut f, "bot.near", LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("BOT2") });
         let mut lz = l(&f, id2);
         lz.step = Step::AddLiquidity;
         lz.inflight = true;
@@ -8655,8 +8773,8 @@ mod v6_tests {
         f.set_locker_add_gas(acct("lock.near"), T_LOCK3_ADD);
         owner();
         f.set_locker_add_buy(acct("lock.near"), flag);
-        let a = LaunchArgs { dev_buy: Some(U128(near)), ..args("AB") };
-        let deposit = f.quote_launch(0, a.dev_buy, None, None).total.0;
+        let a = LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("AB") };
+        let deposit = f.quote_launch(0, a.dev_buy, None, None, None).total.0;
         ctx_tx("alice.near", "alice.near", deposit, 300);
         drop(f.launch(a));
         let id = f.next_id - 1;
@@ -8821,8 +8939,8 @@ mod v6_tests {
         f.set_locker_add_gas(acct("lock.near"), T_LOCK3_ADD);
         owner();
         f.set_locker_add_buy(acct("lock.near"), true);
-        let a = LaunchArgs { dev_buy: near.map(U128), ..args(sym) };
-        let deposit = f.quote_launch(0, a.dev_buy, None, None).total.0;
+        let a = LaunchArgs { pool_fee: None, dev_buy: near.map(U128), ..args(sym) };
+        let deposit = f.quote_launch(0, a.dev_buy, None, None, None).total.0;
         ctx_tx("alice.near", "alice.near", deposit, 270);
         drop(f.launch(a));
         let id = f.next_id - 1;
@@ -8940,12 +9058,12 @@ mod v6_tests {
         owner();
         f.set_tax_token_code_hash(Some("bb".repeat(32)));
         let tax = |c: u16, b: u16, h: u16| Some(TaxArgs { buy_bps: 100, sell_bps: 100, creator_bps: c, burn_bps: b, holders_bps: h });
-        let msg = panics(|| drop(launch_with(&mut f, "alice.near", LaunchArgs { quote: Some(usdc.clone()), fee_mode: Some("burn".into()), tax: tax(5000, 0, 5000), ..args("BTX") })));
+        let msg = panics(|| drop(launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, quote: Some(usdc.clone()), fee_mode: Some("burn".into()), tax: tax(5000, 0, 5000), ..args("BTX") })));
         assert_eq!(msg, "tax: a creator tax share on a pair token needs fee mode creator");
 
-        launch_with(&mut f, "alice.near", LaunchArgs { quote: Some(usdc.clone()), fee_mode: Some("burn".into()), tax: tax(0, 5000, 5000), ..args("BT0") });
-        launch_with(&mut f, "alice.near", LaunchArgs { fee_mode: Some("burn".into()), tax: tax(5000, 0, 5000), ..args("BTN") });
-        launch_with(&mut f, "alice.near", LaunchArgs { quote: Some(usdc.clone()), tax: tax(5000, 0, 5000), ..args("BTC") });
+        launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, quote: Some(usdc.clone()), fee_mode: Some("burn".into()), tax: tax(0, 5000, 5000), ..args("BT0") });
+        launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, fee_mode: Some("burn".into()), tax: tax(5000, 0, 5000), ..args("BTN") });
+        launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, quote: Some(usdc.clone()), tax: tax(5000, 0, 5000), ..args("BTC") });
     }
 
     #[test]
@@ -8989,7 +9107,7 @@ mod v6_tests {
         let ta = l(&f, a).token.clone();
         ctx("owner.near", 0);
         f.set_quote(ta.clone(), 18, -50_000, -80_000, -30_000, 450_000, true);
-        let b = launch_with(&mut f, "alice.near", LaunchArgs { quote: Some(ta.clone()), fee_mode: Some("burn".into()), ..args("PAIRB") });
+        let b = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, quote: Some(ta.clone()), fee_mode: Some("burn".into()), ..args("PAIRB") });
         park(&mut f, b, Step::Done);
         let mut lb = l(&f, b);
         lb.creator_quote_fees = U128(3 * n);
@@ -9312,7 +9430,7 @@ mod v6_tests {
     #[test]
     fn legion_n12_the_quote_covers_the_longest_launch() {
         let mut f = factory();
-        let a = LaunchArgs { name: "\u{1F600}".repeat(32), symbol: "ABCDEFGHIJKL".into(), description: Some("\u{1F600}".repeat(500)), ..args("X") };
+        let a = LaunchArgs { pool_fee: None, name: "\u{1F600}".repeat(32), symbol: "ABCDEFGHIJKL".into(), description: Some("\u{1F600}".repeat(500)), ..args("X") };
         assert_eq!(a.name.len() + a.symbol.len() + a.description.as_ref().unwrap().len(), MAX_TEXT_BYTES);
 
         let id = launch_with(&mut f, "alice.near", a);
@@ -9415,7 +9533,7 @@ mod v6_tests {
     fn owner_repairs_never_clear_a_dev_buy_in_flight_or_skip_to_done() {
         let mut f = factory();
         let near = 10u128.pow(24);
-        let id = launch_with(&mut f, "alice.near", LaunchArgs { dev_buy: Some(U128(near)), ..args("SRG") });
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("SRG") });
 
         let mut lz = l(&f, id);
         lz.step = Step::AddLiquidity;
@@ -9493,7 +9611,7 @@ mod v6_tests {
         owner();
         assert!(panics(|| f.set_range(U64(id), 400, 1000)).contains("only cleared by its own callback"));
         assert!(l(&f, id).inflight);
-        let id = launch_with(&mut f, "alice.near", LaunchArgs { dev_buy: Some(U128(near)), ..args("SD") });
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("SD") });
         park(&mut f, id, Step::DevBuy);
         owner();
         assert!(panics(|| f.set_step(U64(id), Step::Done)).contains("Done needs a position and no dev buy money"));
@@ -9515,7 +9633,7 @@ mod v6_tests {
     fn fix4_sweep_waits_for_a_dev_buys_pending_unwrap() {
         let mut f = factory();
         let near = 10u128.pow(24);
-        let id = launch_with(&mut f, "alice.near", LaunchArgs { dev_buy: Some(U128(near)), ..args("UW") });
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("UW") });
         park(&mut f, id, Step::DevBuy);
         let mut lz = l(&f, id);
         lz.dev_buy_held = U128(0);
@@ -9565,13 +9683,13 @@ mod v6_tests {
         f.wnear_registered = true;
         owner(); f.set_locker_add_gas(acct("lock.near"), T_LOCK3_ADD);
         owner(); f.set_locker_add_buy(acct("lock.near"), true);
-        let a = LaunchArgs { dev_buy: Some(U128(near)), ..args("PA") };
-        let deposit = f.quote_launch(0, a.dev_buy, None, None).total.0;
+        let a = LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("PA") };
+        let deposit = f.quote_launch(0, a.dev_buy, None, None, None).total.0;
         ctx_tx("alice.near", "alice.near", deposit, 300);
         drop(f.launch(a));
         let id = f.next_id - 1;
         let cb = static_gas_of(b"on_created").unwrap();
-        let id2 = launch_with(&mut f, "alice.near", LaunchArgs { dev_buy: Some(U128(near)), ..args("UW") });
+        let id2 = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("UW") });
         owner(); f.set_paused(true);
         ctx_tx(ME, "alice.near", 0, tg_of(cb) + 3);
         let pool = l(&f, id).pool_id;
@@ -9621,10 +9739,10 @@ mod v6_tests {
     #[test]
     fn fix9_quote_launch_covers_the_longest_text() {
         let mut f = factory();
-        let deposit = f.quote_launch(0, None, None, None).total.0;
+        let deposit = f.quote_launch(0, None, None, None, None).total.0;
         ctx("alice.near", deposit);
-        let a = LaunchArgs { name: "\u{1F600}".repeat(32), description: Some("\u{1F600}".repeat(500)), ..args("LONGLONG10") };
-        let cost = f.internal_cost(0, a.name.len() + "LONGLONG10".len(), a.name.len() + "LONGLONG10".len() + 2000, 0, false, f.pool_fronted()).total.0;
+        let a = LaunchArgs { pool_fee: None, name: "\u{1F600}".repeat(32), description: Some("\u{1F600}".repeat(500)), ..args("LONGLONG10") };
+        let cost = f.internal_cost(0, a.name.len() + "LONGLONG10".len(), a.name.len() + "LONGLONG10".len() + 2000, 0, false, f.pool_fronted(), false).total.0;
         drop(f.launch(a));
         assert_eq!(transfers().into_iter().filter(|t| t.0 == "alice.near").map(|t| t.1).sum::<u128>(), deposit - cost, "the surplus comes back in the same call");
     }
@@ -9650,7 +9768,7 @@ mod v6_tests {
         let link = format!("https://{}", "l".repeat(192));
         let name = "\u{1F600}".repeat(32);
         let text = (name.len() + "LONGLONG10".len() + 2000 + 3 * link.len()) as u128;
-        let a = LaunchArgs {
+        let a = LaunchArgs { pool_fee: None,
             name, description: Some("\u{1F600}".repeat(500)),
             links: Some(Links { website: Some(link.clone()), twitter: Some(link.clone()), telegram: Some(link) }),
             fee_to: Some("b".repeat(64).parse().unwrap()),
@@ -9658,7 +9776,7 @@ mod v6_tests {
             ..args("LONGLONG10")
         };
 
-        ctx(&creator, f.quote_launch(0, None, Some(true), None).total.0);
+        ctx(&creator, f.quote_launch(0, None, Some(true), None, None).total.0);
         let before = flushed_usage(&mut f);
         std::mem::forget(f.launch(a));
         let id = f.next_id - 1;
@@ -9667,7 +9785,7 @@ mod v6_tests {
         println!("RECORD worst case: {used} B written, text {text} B, fixed {} B, charged fixed {}", used as i128 - text as i128, RECORD_BASE_BYTES);
         assert!(used <= RECORD_BASE_BYTES + text, "record charge {} B < written {used} B", RECORD_BASE_BYTES + text);
 
-        ctx("bob.near", f.quote_launch(0, None, Some(false), None).total.0);
+        ctx("bob.near", f.quote_launch(0, None, Some(false), None, None).total.0);
         let before = flushed_usage(&mut f);
         std::mem::forget(f.launch(args("PLAIN")));
         let id = f.next_id - 1;
@@ -9680,7 +9798,7 @@ mod v6_tests {
     #[test]
     fn exact_pricing_charges_what_is_stored_and_fronts_the_pool() {
         let f = factory();
-        let q = f.quote_launch(0, None, Some(false), None);
+        let q = f.quote_launch(0, None, Some(false), None, None);
 
         assert_eq!(q.token_storage.0, (TOKEN_BASE_STORAGE_BYTES + MAX_TOKEN_TEXT_BYTES as u128) * STORAGE_PRICE_PER_BYTE + FT_STORAGE_REG.as_yoctonear());
         assert_eq!(q.record_storage.0, (RECORD_BASE_BYTES + (MAX_TEXT_BYTES + MAX_LINKS_BYTES) as u128) * STORAGE_PRICE_PER_BYTE);
@@ -9961,7 +10079,7 @@ mod rv_exact {
         let name = "\u{1F600}".repeat(32);
         let icon = format!("data:image/png;base64,{}", "A".repeat(100));
         let text = (name.len() + 12 + 2000 + 3 * link.len()) as u128;
-        let a = LaunchArgs {
+        let a = LaunchArgs { pool_fee: None,
             name, description: Some("\u{1F600}".repeat(500)),
             links: Some(Links { website: Some(link.clone()), twitter: Some(link.clone()), telegram: Some(link) }),
             fee_to: Some("b".repeat(64).parse().unwrap()),
@@ -9972,7 +10090,7 @@ mod rv_exact {
             holders_paid_in: Some("near".into()),
             ..args("LONGLONGLONG")
         };
-        let deposit = f.quote_launch(icon.len() as u32, None, Some(true), None).total.0;
+        let deposit = f.quote_launch(icon.len() as u32, None, Some(true), None, None).total.0;
         near_sdk::testing_env!(VMContextBuilder::new()
             .current_account_id(acct("nearlytrade.near")).predecessor_account_id(acct(&creator))
             .attached_deposit(NearToken::from_yoctonear(deposit)).account_balance(NearToken::from_near(500))
@@ -10012,8 +10130,8 @@ mod rv_exact {
             let creator = "c".repeat(64);
             let icon = format!("data:image/svg+xml;utf8,<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\">{}</svg>",
                 "<rect x=\"1\" y=\"2\" width=\"3\" height=\"4\" fill=\"#0a0\"/>".repeat(reps));
-            let a = LaunchArgs { icon: Some(icon.clone()), ..args("SVG") };
-            let deposit = f.quote_launch(json_len(&icon) as u32, None, None, None).total.0;
+            let a = LaunchArgs { pool_fee: None, icon: Some(icon.clone()), ..args("SVG") };
+            let deposit = f.quote_launch(json_len(&icon) as u32, None, None, None, None).total.0;
             ctx(&creator, deposit);
             drop(f.launch(a));
             let id = f.next_id - 1;
@@ -10049,14 +10167,14 @@ mod rv_exact {
             .block_timestamp(1_700_000_000_000 * 1_000_000);
         near_sdk::testing_env!(c.build(), near_sdk::test_vm_config(), mainnet_fees());
         assert!(!f.pool_fronted(), "nothing free: a quote charges the full attach");
-        let q = f.quote_launch(0, Some(U128(near)), None, None);
+        let q = f.quote_launch(0, Some(U128(near)), None, None, None);
         assert_eq!(q.pool_create.0, DCL_POOL_CREATE.as_yoctonear());
 
         let deposit = q.total.0;
 
         c.attached_deposit(NearToken::from_yoctonear(deposit)).account_balance(NearToken::from_yoctonear(locked));
         near_sdk::testing_env!(c.build(), near_sdk::test_vm_config(), mainnet_fees());
-        drop(f.launch(LaunchArgs { dev_buy: Some(U128(near)), ..args("FLOAT") }));
+        drop(f.launch(LaunchArgs { pool_fee: None, dev_buy: Some(U128(near)), ..args("FLOAT") }));
         let id = f.next_id - 1;
         let fronted = !env::storage_has_key(&pool_full_key(id));
         let held = l(&f, id).dev_buy_held.0;
@@ -10080,8 +10198,8 @@ mod rv_exact {
         f.dcl_registered = true;
         let creator = "griefer.near";
         let icon = format!("data:image/svg+xml;utf8,{}", "\"".repeat(16_000));
-        let a = LaunchArgs { icon: Some(icon.clone()), ..args("GRIEF") };
-        let deposit = f.quote_launch(json_len(&icon) as u32, None, None, Some(10)).total.0;
+        let a = LaunchArgs { pool_fee: None, icon: Some(icon.clone()), ..args("GRIEF") };
+        let deposit = f.quote_launch(json_len(&icon) as u32, None, None, Some(10), None).total.0;
         let mk = |pred: &str, dep: u128, u: u64| near_sdk::testing_env!(VMContextBuilder::new()
             .current_account_id(acct("nearlytrade.near")).predecessor_account_id(acct(pred))
             .attached_deposit(NearToken::from_yoctonear(dep)).account_balance(NearToken::from_near(500)).storage_usage(u)
@@ -10099,7 +10217,7 @@ mod rv_exact {
         let cost = deposit - back1 - back2;
         println!("RV GRIEF: launch Failed={}, record keeps icon {} B; factory storage +{used} B (= {:.4} N locked), record_storage charged {:.4} N; creator net cost {:.4} N (+gas)",
             l(&f, id).step == Step::Failed, l(&f, id).icon.as_ref().map(|i| i.len()).unwrap_or(0), used as f64 / 1e5,
-            f.internal_cost(json_len(&icon), 10, 10, 0, false, true).record_storage.0 as f64 / 1e24, cost as f64 / 1e24);
+            f.internal_cost(json_len(&icon), 10, 10, 0, false, true, false).record_storage.0 as f64 / 1e24, cost as f64 / 1e24);
         assert!(l(&f, id).icon.is_none(), "a Failed launch keeps a {} B icon nobody paid for", icon.len());
     }
 
@@ -10117,3 +10235,227 @@ mod rv_exact {
     }
 }
 
+
+
+#[cfg(test)]
+mod fee01_tests {
+    use super::*;
+    use super::v6_tests::{args, calls, ctx, factory, launch_with};
+
+
+    fn launch_scheduled(f: &mut Factory, who: &str, a: LaunchArgs) -> u64 {
+        let icon_len = a.icon.as_ref().map(|s| s.len()).unwrap_or(0) as u32;
+        let deposit = f.quote_launch(icon_len, a.dev_buy, Some(a.tax.is_some()), None, None).total.0;
+        ctx(who, deposit);
+        drop(f.launch(a));
+        f.next_id - 1
+    }
+
+    #[test]
+    fn a_001_launch_opens_on_the_fee_100_pool_and_its_1_point_grid() {
+        let mut f = factory();
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: Some(100), ..args("CAT") });
+        let l = f.rec(id);
+        assert!(l.pool_id.ends_with("|100"), "{}", l.pool_id);
+        assert_eq!(fee_of(&l.pool_id), 100);
+        if l.token_is_x {
+            assert_eq!(l.left_point, l.init_point + 1, "single-sided from one grid step above the start");
+        } else {
+            assert_eq!(l.right_point, l.init_point - 1, "single-sided from one grid step below the start");
+        }
+    }
+
+    #[test]
+    fn a_default_launch_stays_on_the_1pct_tier() {
+        let mut f = factory();
+        let id = launch_with(&mut f, "alice.near", args("DOG"));
+        let l = f.rec(id);
+        assert!(l.pool_id.ends_with("|10000"), "{}", l.pool_id);
+        assert_eq!(fee_of(&l.pool_id), 10_000);
+        if l.token_is_x { assert_eq!(l.left_point, l.init_point + 200) } else { assert_eq!(l.right_point, l.init_point - 200) }
+    }
+
+    #[test]
+    #[should_panic(expected = "pool_fee: 10000 (1%), 2000 (0.2%), 400 (0.04%) or 100 (0.01%)")]
+    fn other_tiers_are_refused() {
+        let mut f = factory();
+        launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: Some(500), ..args("BAD") });
+    }
+
+    #[test]
+    fn create_pool_carries_the_launch_tier() {
+        let mut f = factory();
+        launch_scheduled(&mut f, "alice.near", LaunchArgs { pool_fee: Some(100), ..args("CAT") });
+        let c = calls();
+        assert!(c.iter().any(|c| c.1 == "create_pool" && c.2.contains("\"fee\":100")), "{:?}", c.iter().map(|c| (&c.1, &c.2)).collect::<Vec<_>>());
+        assert!(!c.iter().any(|c| c.1 == "create_pool" && c.2.contains("\"fee\":10000")));
+    }
+
+    #[test]
+    fn a_1pct_launch_still_creates_the_1pct_pool() {
+        let mut f = factory();
+        launch_scheduled(&mut f, "alice.near", args("DOG"));
+        assert!(calls().iter().any(|c| c.1 == "create_pool" && c.2.contains("\"fee\":10000")));
+    }
+
+    #[test]
+    fn no_rules_when_the_window_is_off() {
+        let mut f = factory();
+        launch_scheduled(&mut f, "alice.near", args("CAT"));
+        let c = calls();
+        assert!(c.iter().any(|c| c.1 == "create_pool"), "launch scheduled");
+        assert!(!c.iter().any(|c| c.2.contains("max_wallet_bps")), "config 0 = no launch rules");
+    }
+
+    #[test]
+    fn dev_buy_cap_by_tier() {
+        let f = factory();
+        let one = f.get_dev_buy_cap(None).0;
+        assert_eq!(one, f.get_dev_buy_cap(Some(10_000)).0);
+        assert!(f.get_dev_buy_cap(Some(100)).0 < one, "the 0.01% pool starts one smaller step up and takes a smaller fee");
+    }
+
+    #[test]
+    fn fee_of_reads_the_pool_suffix() {
+        assert_eq!(fee_of("a.near|wrap.near|10000"), 10_000);
+        assert_eq!(fee_of("a.near|wrap.near|100"), 100);
+        assert_eq!(fee_of("garbage"), 10_000);
+        assert_eq!((point_delta(100), point_delta(10_000)), (1, 200));
+    }
+}
+
+
+
+#[cfg(test)]
+mod fee01b_tests {
+    use super::*;
+    use super::v6_tests::{args, calls, ctx, factory, l, launch_with};
+    use near_sdk::test_utils::get_logs;
+
+    fn add_step(f: &mut Factory, id: u64) {
+        let pool = l(f, id).pool_id;
+        drop(f.on_created(id, None, Ok(StorageBalanceJson { total: "0".into() }), Ok(pool)));
+    }
+
+    #[test]
+    fn every_tier_launches_on_its_own_pool() {
+        for fee in [10_000u32, 2_000, 400, 100] {
+            let mut f = factory();
+            let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: Some(fee), ..args("CAT") });
+            let x = l(&f, id);
+            assert!(x.pool_id.ends_with(&format!("|{}", fee)), "{}", x.pool_id);
+            assert!(x.token_is_x);
+            assert_eq!(x.left_point, x.init_point + point_delta(fee));
+        }
+    }
+
+    #[test]
+    fn low_tiers_top_out_at_ten_million() {
+        for fee in [2_000u32, 400, 100] {
+            let mut f = factory();
+            let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: Some(fee), ..args("CAT") });
+            assert_eq!(l(&f, id).right_point, LOW_FEE_TOP_POINT, "fee {}", fee);
+        }
+        let mut f = factory();
+        let id = launch_with(&mut f, "alice.near", args("CAT"));
+        assert_eq!(l(&f, id).right_point, POINT_MAX, "1% keeps the open range");
+    }
+
+    #[test]
+    #[should_panic(expected = "pool_fee under 1%: NEAR pair only, for a ticker whose account sorts before wrap.near")]
+    fn a_low_tier_needs_the_token_as_x() {
+        let mut f = factory();
+        launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: Some(100), ..args("ZED") });
+    }
+
+    #[test]
+    #[should_panic(expected = "pool_fee under 1%: no tax")]
+    fn a_low_tier_has_no_tax() {
+        let mut f = factory();
+        env::storage_write(TAX_CODE_KEY, &[0xbb; 32]);
+        env::storage_write(TAX_CODE_KEY, &[0xbb; 32]);
+        let tax = TaxArgs { buy_bps: 100, sell_bps: 100, creator_bps: 10_000, burn_bps: 0, holders_bps: 0 };
+        launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: Some(100), tax: Some(tax), ..args("CAT") });
+    }
+
+    #[test]
+    fn a_1pct_launch_may_sort_after_wrap() {
+        let mut f = factory();
+        let id = launch_with(&mut f, "alice.near", args("ZED"));
+        assert!(!l(&f, id).token_is_x);
+    }
+
+    #[test]
+    fn the_quote_carries_the_dust_order_only_where_it_is_placed() {
+        let f = factory();
+        let base = f.quote_launch(0, None, None, None, None);
+        assert_eq!(base.floor_order.0, 0);
+        for (fee, dust) in [(10_000u32, false), (2_000, false), (400, true), (100, true)] {
+            let q = f.quote_launch(0, None, None, None, Some(fee));
+            let extra = if dust { DUST_ORDER + DUST_SLOT } else { 0 };
+            assert_eq!((q.floor_order.0, q.total.0), (extra, base.total.0 + extra), "fee {}", fee);
+        }
+    }
+
+    #[test]
+    fn the_dust_order_goes_out_before_the_locker_add() {
+        let mut f = factory();
+        let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: Some(100), ..args("CAT") });
+        assert_eq!(f.get_dust_fund().0, DUST_SLOT, "the creator's slot waits in the fund");
+        add_step(&mut f, id);
+        let x = l(&f, id);
+        let c = calls();
+        let dep = c.iter().position(|c| c.0 == "wrap.near" && c.1 == "near_deposit" && c.3 == DUST_ORDER).expect("near_deposit of the dust");
+        let ord = c.iter().position(|c| c.0 == "wrap.near" && c.1 == "ft_transfer_call" && c.2.contains("LimitOrder") && c.2.contains(&format!("\\\"point\\\":{}", x.init_point - 1))).expect("the LimitOrder one point under the start");
+        let add = c.iter().position(|c| c.1 == "add").expect("the locker add");
+        assert!(dep < ord && ord < add, "{:?}", c.iter().map(|c| (&c.0, &c.1)).collect::<Vec<_>>());
+        assert!(c[ord].2.contains(&x.token.to_string()) && c[ord].2.contains("dclv2.ref-labs.near"));
+        assert!(get_logs().iter().any(|g| g.contains("dust_order")));
+    }
+
+    #[test]
+    fn no_dust_order_on_the_wide_grids() {
+        for fee in [10_000u32, 2_000] {
+            let mut f = factory();
+            let id = launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: Some(fee), ..args("CAT") });
+            assert_eq!(f.get_dust_fund().0, 0);
+            add_step(&mut f, id);
+            let c = calls();
+            assert!(c.iter().any(|c| c.1 == "add"), "the locker add still goes out");
+            assert!(!c.iter().any(|c| c.2.contains("LimitOrder")), "fee {}: no dust order", fee);
+        }
+    }
+
+    #[test]
+    fn top_up_moves_the_slot_fund_to_rhea() {
+        let mut f = factory();
+        launch_with(&mut f, "alice.near", LaunchArgs { pool_fee: Some(400), ..args("CAT") });
+        launch_with(&mut f, "bob.near", LaunchArgs { pool_fee: Some(100), ..args("DOG") });
+        ctx("anyone.near", 0);
+        drop(f.top_up_dcl_slots());
+        assert_eq!(f.get_dust_fund().0, 0);
+        assert!(calls().iter().any(|c| c.0 == "dclv2.ref-labs.near" && c.1 == "storage_deposit" && c.3 == 2 * DUST_SLOT && c.2.contains("nearlytrade.near")));
+    }
+
+    #[test]
+    #[should_panic(expected = "no order-slot payments to move")]
+    fn top_up_with_nothing_to_move() {
+        let mut f = factory();
+        ctx("anyone.near", 0);
+        drop(f.top_up_dcl_slots());
+    }
+
+    #[test]
+    fn migrate_registers_on_rhea_once_and_changes_nothing_else() {
+        let mut f = factory();
+        let (cfg, code) = (f.get_config(), f.token_code_hash);
+        ctx("nearlytrade.near", 0);
+        assert!(f.migrate());
+        assert!(calls().iter().any(|c| c.0 == "dclv2.ref-labs.near" && c.1 == "storage_deposit" && c.3 == DCL_SELF_STORAGE && c.2.contains("nearlytrade.near")));
+        assert_eq!((f.config.max_wallet_bps, f.config.max_wallet_ms), (cfg.max_wallet_bps, cfg.max_wallet_ms), "max wallet untouched");
+        assert_eq!(f.token_code_hash, code, "token build untouched");
+        ctx("nearlytrade.near", 0);
+        assert!(f.migrate());
+        assert!(!calls().iter().any(|c| c.1 == "storage_deposit" && c.3 == DCL_SELF_STORAGE), "Rhea is not paid twice");
+    }
+}
